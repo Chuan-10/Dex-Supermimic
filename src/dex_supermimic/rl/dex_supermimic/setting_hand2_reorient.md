@@ -18,16 +18,16 @@ uv run dex-supermimic-train --task hand2-reorient --num-envs 1024 --device cuda:
 | Actor 输入：3 帧历史 | 207 |
 | Actor 输出：raw action | 20 |
 | 物理状态 `x` | 58 |
-| 固定仿真上下文 `xi` | 106 |
+| 固定仿真上下文 `xi` | 46 |
 | 外部扰动缓存 | 9 |
-| WM 的 `dynamics` 参数 | 173 |
-| WM 实际网络输入：`[dynamics, u]` | **193** |
+| WM 的 `dynamics` 参数 | 113 |
+| WM 实际网络输入：`[dynamics, u]` | **133** |
 | WM 原始网络输出：`[delta, contact_logits]` | **84 = 52 + 32** |
 | WM `forward()` 返回 | `(x1:58, contact_logits:32)` |
-| Critic 输入：`[task_frame, xi]` | **268 = 162 + 106** |
+| Critic 输入：`[task_frame, xi]` | **211 = 165 + 46** |
 | Critic 输出 | 1 |
 
-这些维度已用当前资源实际构建环境并核对。本任务的维度与另一种手型不同；更换碰撞几何后，以运行时网络及日志 `input_layout.json`、`context.json` 为准。接触维度来自 `SimReader.contact().shape[-1]`。
+这些维度已用当前资源实际构建环境并核对。两个 reorientation 手型的 WM 维度相同，但接触维度和 geom 资源不同；更换碰撞几何后，以运行时网络及日志 `input_layout.json`、`context.json` 为准。接触维度来自 `SimReader.contact().shape[-1]`。
 
 ## 2. 统一状态与坐标系
 
@@ -120,14 +120,14 @@ x1_t, contact_logits_t = wm(x_t, u_t, dynamics_t)
 | 输入项 | 维度 | 来源 |
 | --- | ---: | --- |
 | 当前物理状态 `x_t` | 58 | 首步读真实状态，后续读预测状态 |
-| 活跃碰撞几何的摩擦参数 | 66 = 22×3 | startup 后读取的仿真上下文 |
+| wuji-mjlab `dr_params` | 6 | `[摩擦, 物体质量, Kp, Kd, 关节 damping, 物体尺寸]` 的均值比例，顺序与原 critic 完全一致 |
 | 20 个 actuator 的 Kp 比率 | 20 | 当前值 / 默认值 |
 | 20 个 actuator 的 Kd 比率 | 20 | 当前值 / 默认值；MuJoCo bias 中保留负号 |
 | 扰动缓存 | 9 | `[方向3, 最近一次线/角速度扰动6]` |
 | actuator 目标 `u_t` | 20 | Actor + EMA 控制器 |
-| **合计** | **193** |  |
+| **合计** | **133** |  |
 
-`xi` 是摩擦及 Kp/Kd 的合并表示，在 rollout 内保留；不是每步由 WM 重新预测。缓存描述最近一次扰动事件，**不是尚未发生的下一次扰动的预知输入**。
+`xi` 是参考任务 6 维 DR 汇总和逐 actuator Kp/Kd 比率的合并表示，在 rollout 内保留；不是每步由 WM 重新预测。缓存描述最近一次扰动事件，**不是尚未发生的下一次扰动的预知输入**。
 
 目标姿态、保持计数、episode age、cage counter、动作历史、reward、Critic task frame 不进入 WM 的动力学网络。
 
@@ -230,7 +230,7 @@ next_dynamics = observations.dynamics(next_x, xi, next_auxiliary[:, 12:21])
 - 每步 `x1` 保持 `[2,58]`，接触输出为 `[2,32]`。
 - 无 push 时，下一步 `dynamics` 前 58 维与上一步 `x1` 逐元素相等。
 - 更新控制记忆和观测历史后，Actor 继续接受 `[2,207]` 并输出 `[2,20]`。
-- Critic 接受 268 维特征，输出 `[2]`；状态、reward、value 均有限。
+- Critic 接受 211 维特征，输出 `[2]`；状态、reward、value 均有限。
 
 该检查确认了**接口与计算图能够递推**，并不证明多步预测误差小或已经具备精确的 Markov 动力学。当前实现还有以下边界：
 
@@ -246,7 +246,7 @@ next_dynamics = observations.dynamics(next_x, xi, next_auxiliary[:, 12:21])
 
 代码：[observations.py](observations.py) 的 `frame/context/critic`、[networks.py](networks.py) 的 `Critic`。
 
-Critic 没有三帧历史，输入为 `[task_frame(162), xi]`。`context()` 内部先拼 `[xi, task_frame]`，再由 `critic()` 重排。
+Critic 没有三帧历史，输入为 `[task_frame(165), xi]`。`context()` 内部先拼 `[xi, task_frame]`，再由 `critic()` 重排。
 
 | task frame 项 | 维度 | 说明 |
 |---|---:|---|
@@ -259,14 +259,14 @@ Critic 没有三帧历史，输入为 `[task_frame(162), xi]`。`context()` 内�
 | 扰动方向与速度缓存 | 9 | 世界系缓存 |
 | `state_progress` | 4 | hold/hold_steps、reward_window/switch_steps、age/max_episode_length、count |
 | `cage_counter` | 1 | `min(cage/max_outside,1)` |
-| `dr_params` | 3 | 物体质量比、关节 damping 比、物体尺寸比 |
+| `dr_params` | 6 | 依次为摩擦、物体质量、Kp、Kd、关节 damping、物体尺寸的均值比例 |
 | `palm_rot_6d` | 6 | 掌心世界旋转矩阵后两行 |
-| **合计** | **162** | |
+| **合计** | **165** | |
 
-原环境 critic observation 的 `dr_params` 有 6 维；这里保留索引 `[1,4,5]`，其余信息由独立 `xi` 提供，所以 162 维重建帧不是直接照搬原环境整个 observation 向量。
+当前 `dr_params` 与原环境 critic 的 6 维定义和顺序完全一致。注意这 6 个标量也会出现在 `xi` 开头；`xi` 随后仍保留逐关节 Kp/Kd 比例，用于解析 torque 和提供更细粒度的仿真上下文。
 
 ```text
-RunningNorm(268) → MLP(512,256,128; ELU) → Linear(1)
+RunningNorm(211) → MLP(512,512,256,128; ELU) → Linear(1)
 返回 V(s_t): [B]；无 tanh、sigmoid，也不是 Q(s,a)。
 ```
 
@@ -368,7 +368,7 @@ tau_normalized = force / max(effort_limit, 1e-3)  # 若存在 effort_limit
 
 WM 不学习直接输出 reward。reward 由预测物理状态、预测接触、解析 torque 和任务记忆计算。
 
-FailureHead 是额外的终止预测器，输入 `[x1, context(x1,next_memory,auxiliary,xi)]`，本任务为 326 维（58 + 268），输出一个 logit。训练代码使用 replay 的 `terminated` 标签；timeout 不在此标签中，NaN/非有限 transition 通过 valid mask 排除。
+FailureHead 是额外的终止预测器，输入 `[x1, context(x1,next_memory,auxiliary,xi)]`，本任务为 269 维（58 + 211），输出一个 logit。训练代码使用 replay 的 `terminated` 标签；timeout 不在此标签中，NaN/非有限 transition 通过 valid mask 排除。
 
 默认在 `wm_only_iters + failure_warmup_iters = 500+300` 轮后参与想象终止：
 

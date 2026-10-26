@@ -9,6 +9,18 @@ from .rotations import mv
 
 from .state import unpack
 
+# Keep this order synchronized with wuji-mjlab's reorient
+# ``dr_params_privileged`` observation term.
+DR_PARAM_NAMES = (
+    "friction_ratio",
+    "object_mass_ratio",
+    "kp_ratio",
+    "kd_ratio",
+    "joint_damping_ratio",
+    "object_size_ratio",
+)
+DR_PARAM_DIM = len(DR_PARAM_NAMES)
+
 BASE_TERMS = {
     "joint_angles": 20,
     "qpos_error": 20,
@@ -28,8 +40,7 @@ CURRENT_TERMS = {
     "pert_velocity": 6,
     "state_progress": 4,
     "cage_counter": 1,
-    # Friction/Kp/Kd ratios are redundant with the detailed simulator context.
-    "dr_params": 3,
+    "dr_params": 6,
     "palm_rot_6d": 6,
 }
 BASE_DIM = sum(BASE_TERMS.values())
@@ -64,7 +75,7 @@ class TaskObservations:
 
         runtime = get_reorient_runtime_state(env)
         cfg = env.observation_manager.get_term_cfg("critic", "dr_params")
-        dr = cfg.func(env, **cfg.params)[:, [1, 4, 5]]
+        dr = cfg.func(env, **cfg.params)
         return torch.cat(
             (
                 reader.palm_pos - env.scene.env_origins,
@@ -79,7 +90,7 @@ class TaskObservations:
     def frame(self, x, memory, auxiliary):
         """Match the original critic's term frames, including frames and scaling."""
         position, rotation, direction, perturbation, dr = auxiliary.split(
-            (3, 9, 3, 6, 3), -1
+            (3, 9, 3, 6, DR_PARAM_DIM), -1
         )
         rotation = rotation.reshape(-1, 3, 3)
         q, qd, _, _, v, w = unpack(x)
@@ -126,7 +137,12 @@ class TaskObservations:
         return torch.cat((simulator_context, self.frame(x, memory, auxiliary)), -1)
 
     def dynamics(self, x, simulator_context, disturbance):
-        """Dynamics-only features: physics state plus startup and exogenous context."""
+        """Dynamics-only features: physics state plus startup and exogenous context.
+
+        ``simulator_context`` includes all six reference DR ratios followed by
+        exact per-joint Kp/Kd ratios, so the WM receives the complete simulation
+        context rather than only the critic's DR projection.
+        """
         q, qd, position, rotation, velocity, angular_velocity = unpack(x)
         return torch.cat(
             (
@@ -144,5 +160,6 @@ class TaskObservations:
 
     @staticmethod
     def critic(context):
-        # Current task frame followed by simulator parameters, with no time axis.
+        # FailureHead context is [xi, task_frame]. Match the reference critic by
+        # moving its 165-dim task frame to the front and appending the 46-dim xi.
         return torch.cat((context[..., -FRAME_DIM:], context[..., :-FRAME_DIM]), -1)

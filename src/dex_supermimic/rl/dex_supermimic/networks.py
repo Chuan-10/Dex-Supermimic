@@ -99,7 +99,7 @@ class Critic(nn.Module):
         super().__init__()
         self.amp = amp
         self.norm = RunningNorm(dim)
-        self.net = mlp(dim, [512, 256, 128], 1)
+        self.net = mlp(dim, [512, 512, 256, 128], 1)
 
     def forward(self, x):
         features = self.norm(x)

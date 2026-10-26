@@ -5,6 +5,7 @@ from .rotations import quat_to_mat, mm, mv
 from .state import pack
 from .kinematics import HandKinematics
 from .mdp import DexMDP
+from .observations import DR_PARAM_NAMES
 
 
 class SimReader:
@@ -162,34 +163,29 @@ class SimReader:
         return ids[active]
 
     def context(self):
-        """Read friction and actuator context shared by WM, failure head and critic."""
+        """Read the reference DR summary and actuator context used by all modules."""
         model = self.env.sim.model
         N = self.env.num_envs
         values = []
         self.context_names = []
-        groups = [
-            (
-                "geom",
-                self.collision_geom_ids(),
-                ("geom_friction",),
-            ),
-        ]
-        for _, ids, fields in groups:
-            for name in fields:
-                value = getattr(model, name)
-                default = self.env.sim.get_default_field(name)
-                # Expanded fields have an environment axis; invariant fields don't.
-                if value.ndim == default.ndim + 1:
-                    value = value[:, ids].expand(N, *value[:, ids].shape[1:])
-                else:
-                    value = value[ids].unsqueeze(0).expand(N, *value[ids].shape)
-                values.append(value.reshape(N, -1).clone())
-                self.context_names.append((name, values[-1].shape[-1]))
+        # Include the complete reference-task DR summary. Its friction mean
+        # replaces the former vector of per-geom friction ratios.
+        dr_cfg = self.env.observation_manager.get_term_cfg("critic", "dr_params")
+        dr_params = dr_cfg.func(self.env, **dr_cfg.params)
+        if dr_params.shape[-1] != len(DR_PARAM_NAMES):
+            raise ValueError(
+                f"Expected {len(DR_PARAM_NAMES)} reference DR ratios, got "
+                f"{dr_params.shape[-1]}"
+            )
+        for name, value in zip(
+            DR_PARAM_NAMES,
+            dr_params.unbind(-1),
+            strict=True,
+        ):
+            values.append(value.reshape(N, 1))
+            self.context_names.append((name, 1))
 
-        # Keep the actuator context compact while preserving per-joint DR:
-        # expose each actuator's Kp/Kd ratio relative to the immutable model
-        # defaults. MuJoCo arrays can vary in parameter width, so index only
-        # the PD slots rather than assuming a fixed 7- or 10-element layout.
+        # Exact per-joint gains remain at the end for analytic torque reconstruction.
         actuator_ids = self.robot.indexing.ctrl_ids.long()
         default_gainprm = self.env.sim.get_default_field("actuator_gainprm")
         default_biasprm = self.env.sim.get_default_field("actuator_biasprm")

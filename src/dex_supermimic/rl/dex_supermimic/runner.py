@@ -24,7 +24,7 @@ from .metrics import MetricLogger
 from .buffer import ReplayBuffer
 from .common import RunningNorm
 from .networks import Actor, Critic, FailureHead, WorldModel
-from .observations import BASE_TERMS, CURRENT_TERMS, TaskObservations
+from .observations import BASE_TERMS, CURRENT_TERMS, DR_PARAM_NAMES, TaskObservations
 from .sim import SimReader
 from .state import difference, ema_target, flatten_memory, unflatten_memory
 
@@ -176,7 +176,7 @@ class DexSuperMimicRunner:
             "wm_input_dim": self.wm.norm.mean.numel(),
             "critic_input_dim": self.critic.norm.mean.numel(),
             "dynamics_input_dim": dynamics_dim,
-            "dr_params": [] if self.is_pen else ["object_mass_ratio", "joint_damping_ratio", "object_size_ratio"],
+            "dr_params": [] if self.is_pen else list(DR_PARAM_NAMES),
             "wm_extra_terms": {"control_target": 20},
             "simulator_context": self.reader.context_names,
         }

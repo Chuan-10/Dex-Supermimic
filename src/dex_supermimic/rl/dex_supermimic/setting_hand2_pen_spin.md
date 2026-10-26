@@ -18,21 +18,21 @@ uv run dex-supermimic-train --task hand2-pen-spin --num-envs 1024 --device cuda:
 | Actor 单帧观测 / 实际输入 | **155** |
 | Actor 输出：raw action | 20 |
 | 物理状态 `x` | 58 |
-| 固定仿真上下文 `xi` | **112** |
+| 固定仿真上下文 `xi` | **46** |
 | 外部 wrench 条件 | **174 = 29×6** |
-| WM 的 `dynamics` 参数 | **344 = 58+112+174** |
-| WM 实际网络输入：`[dynamics,u]` | **364** |
+| WM 的 `dynamics` 参数 | **278 = 58+46+174** |
+| WM 实际网络输入：`[dynamics,u]` | **298** |
 | WM 原始网络输出：`[delta,contact_logits]` | **67 = 52+15** |
 | WM `forward()` 返回 | `(x1:58, contact_logits:15)` |
 | Critic 干净任务帧 | 301 |
 | Critic 输入（与 wuji-mjlab 相同） | **301** |
-| FailureHead privileged context | **434 = 301+20+1+112** |
+| FailureHead privileged context | **368 = 301+20+1+46** |
 | Critic 输出 | 1 |
-| FailureHead 输入：`[x1,context]` | **492 = 58+434** |
+| FailureHead 输入：`[x1,context]` | **426 = 58+368** |
 | FailureHead 输出 | 1 logit |
 | Replay 中展开的任务/控制器记忆 `m` | 230 |
 
-当前 `xi` 与 Hand 2 reorientation 共用读取逻辑，仅包含摩擦参数和 Kp/Kd 比例。默认训练主干为 `(2048,2048,2048)`，输入输出维度不受隐藏宽度影响。几何或资源更换后，以运行时日志为准。
+当前 `xi` 与 Hand 2 reorientation 共用读取逻辑，包含参考任务 6 维 DR 汇总以及逐 actuator Kp/Kd 比例。默认训练主干为 `(2048,2048,2048)`，输入输出维度不受隐藏宽度影响。几何或资源更换后，以运行时日志为准。
 
 本任务仅支持 **50 Hz**：`physics_dt=0.005 s`、`decimation=4`、`control_dt=0.02 s`，每个控制步推进一帧 50 Hz 示范。
 
@@ -167,8 +167,8 @@ u_t = where(frozen_dof, previous_executed_target, u_candidate_t)
 ### 4.1 输入
 
 ```python
-dynamics_t = concat(x_t, xi, wrench_t)       # 344
-network_input_t = concat(dynamics_t, u_t)   # 364
+dynamics_t = concat(x_t, xi, wrench_t)       # 278
+network_input_t = concat(dynamics_t, u_t)   # 298
 x1_t, contact_logits_t = wm(x_t, u_t, dynamics_t)
 ```
 
@@ -178,12 +178,12 @@ x1_t, contact_logits_t = wm(x_t, u_t, dynamics_t)
 
 | 字段 | 维度 | 含义 |
 | --- | ---: | --- |
-| `geom_friction` | 72 | 24 个活跃碰撞 geom 的三项摩擦参数 |
+| reorient `dr_params` 汇总 | 6 | 由 reorient 观测函数按 cube 模型读取；笔质量/尺寸映射不能按字面解释 |
 | `actuator_kp_ratios` | 20 | 当前 Kp / 默认 Kp |
 | `actuator_kd_ratios` | 20 | 当前 Kd bias / 默认 Kd bias |
-| **合计** | **112** | startup 后读取，rollout 内保留 |
+| **合计** | **46** | startup 后读取，rollout 内保留 |
 
-力矩上限单独保存在 `m.limits`，供解析 torque 和过流奖励使用，不拼入 `xi`，也不作为 WM、Critic 或 FailureHead 输入。Critic 同样不读取 `xi`。
+力矩上限单独保存在 `m.limits`，供解析 torque 和过流奖励使用，不拼入 `xi`，也不作为 WM、Critic 或 FailureHead 输入。Critic 同样不读取 `xi`。笔任务当前没有 `joint_damping` DR，该项恒为 0；笔本身的密度/轴向拉伸、接触求解参数、关节摩擦和手部质量/惯量仍未显式输入。
 
 `wrench_t` 为 `robot.data.body_external_wrench` 与 `object.data.body_external_wrench` 展平拼接，合计 29 个 body、每个 6 维，**沿用 entity 数据的原始表达**。它不是立方体任务的 9 维方向/速度扰动缓存。
 
@@ -193,7 +193,7 @@ x1_t, contact_logits_t = wm(x_t, u_t, dynamics_t)
 
 ### 4.2 原始输出与 `forward()` 返回值
 
-默认主干：`RunningNorm(364) → 2048 → 2048 → 2048 → Linear(67)`；每个隐藏层使用 LayerNorm + SiLU，隐藏宽度可配置。
+默认主干：`RunningNorm(298) → 2048 → 2048 → 2048 → Linear(67)`；每个隐藏层使用 LayerNorm + SiLU，隐藏宽度可配置。
 
 前 52 维为归一化物理增量：
 
@@ -290,7 +290,7 @@ next_observation = mdp.policy_observation(next_x,next_m,next_auxiliary)
 当前实现的边界：
 
 1. 完整循环依赖外部保留的参考帧表、`xi`、任务记忆、encoder bias、相机随机量及冻结采样；它们不由 WM 输出。
-2. `xi` 仅包含摩擦参数和 Kp/Kd 比例；质量、惯量、尺寸、接触求解器参数、关节被动参数和力矩上限均不作为网络输入。物理域随机化仍在真实仿真中生效。
+2. `xi` 包含参考任务 6 维 DR 汇总和逐 actuator Kp/Kd 比例；惯量、接触求解器参数、关节被动参数和力矩上限仍不作为网络输入。物理域随机化仍在真实仿真中生效。
 3. MuJoCo reward phase 的 body/site 运动学滞后最终积分状态一个 physics substep；解析 reward 从积分后的状态重建几何。解析 torque 使用控制步入口状态，也不同于真实最后子步实测 actuator force。
 4. Critic 沿用 wuji-mjlab 的 301 维干净任务帧，不追加过流积分、参考时间或 `xi`。FailureHead 的 privileged context 追加这些字段，但没有显式加入 wrench、EMA residual、mask、相机状态或距参考结束的剩余步数；两者均不包含完整闭环记忆。
 5. FailureHead 的 true replay 分支使用 `x1` 与记录的步入口 `m` 构造 context；predicted 分支和想象分支使用递推后的 memory。参考时间及过流积分存在时序差别，本文记录当前行为，未在本次文档任务中修改代码。
@@ -315,7 +315,7 @@ Critic 与 `thirdparty/wuji-mjlab/src/wuji_mjlab/tasks/pen_spin/pen_spin_env_cfg
 FailureHead 使用的完整 privileged context 与 Critic 输入分开：
 
 ```text
-context = [task_frame(301), charge(20), time*0.02(1), xi(112)]   # 434
+context = [task_frame(301), charge(20), time*0.02(1), xi(46)]    # 368
 critic_input = context[..., :301]                            # 仅取原版干净任务帧
 ```
 
@@ -336,13 +336,13 @@ L_critic = mean((V(s_t)-stop_gradient(G_t))^2)
 
 Actor 最大化折扣、存活加权的想象收益，在 horizon 末用 Critic bootstrap。Actor 更新期间冻结 WM、Critic、FailureHead 参数，但保留输入到动作的梯度。
 
-本次输入对齐后，旧版 434 维 Critic checkpoint 不能直接完整恢复到新的 301 维 Critic，需重新训练或显式迁移 Critic 权重。
+本次输入对齐后，旧版 privileged checkpoint 不能直接完整恢复到新的 368 维 FailureHead context，需重新训练或显式迁移权重。
 
 ### 6.2 FailureHead
 
 ```text
-features = [x1(58), context(434)]             # 492
-RunningNorm(492) → MLP(256,128; ELU) → Linear(1)
+features = [x1(58), context(368)]             # 426
+RunningNorm(426) → MLP(256,128; ELU) → Linear(1)
 sigmoid(output) = learned physical-failure probability
 ```
 

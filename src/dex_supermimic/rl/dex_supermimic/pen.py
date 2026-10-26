@@ -124,11 +124,12 @@ class PenMDP(DexMDP):
     def command_step(self, x, memory, next_goal, soft=False):
         return dict(memory, time=memory["time"] + 1)
 
-    def pd_torque(self, x, u, context=None):
+    def pd_torque(self, x, u, context=None, *, limits=None):
         q, qd, *_ = unpack(x)
         kp = self.kp_default * context[..., -40:-20]
         kd = self.kd_default * context[..., -20:]
-        limits = context[..., self.limit_slice]
+        if limits is None:
+            limits = self.force_limit
         return (kp * (u - q) + kd * qd).clamp(-limits, limits)
 
     def rewards(self, x1, memory, action, residual, contact, torque, soft=False):
@@ -231,37 +232,12 @@ class PenSimReader(SimReader):
         self.xi = self.context()
         self.reward_snapshot = None
 
-    def context(self):
-        base = super().context()
-        base_names = self.context_names
-        robot, obj = self.robot.indexing, self.obj.indexing
-        values, names = [], []
-        for name, ids in (
-            ("body_mass", torch.cat((robot.body_ids, obj.body_ids)).long()),
-            ("body_inertia", torch.cat((robot.body_ids, obj.body_ids)).long()),
-            ("body_ipos", torch.cat((robot.body_ids, obj.body_ids)).long()),
-            ("body_iquat", torch.cat((robot.body_ids, obj.body_ids)).long()),
-            ("geom_size", self.collision_geom_ids()),
-            ("geom_solref", self.collision_geom_ids()),
-            ("geom_solimp", self.collision_geom_ids()),
-            ("dof_armature", robot.joint_v_adr.long()),
-            ("dof_damping", robot.joint_v_adr.long()),
-            ("dof_frictionloss", robot.joint_v_adr.long()),
-            ("actuator_forcerange", robot.ctrl_ids.long()),
-        ):
-            current = getattr(self.env.sim.model, name)
-            default = self.env.sim.get_default_field(name)
-            value = current[:, ids] if current.ndim == default.ndim + 1 else current[ids][None]
-            value = value.expand(self.env.num_envs, *value.shape[1:]).flatten(1).clone()
-            if name == "actuator_forcerange":
-                # Store upper symmetric torque caps only.
-                value = value[:, 1::2]
-                start = sum(v.shape[-1] for v in values)
-                self.mdp.limit_slice = slice(start, start + 20)
-            values.append(value)
-            names.append((name, value.shape[-1]))
-        self.context_names = names + base_names
-        return torch.cat((*values, base), -1)
+    def torque_limits(self):
+        """Read controller metadata without adding it to the network context."""
+        ids = self.robot.indexing.ctrl_ids.long()
+        force = self.env.sim.model.actuator_forcerange
+        limits = force[:, ids, 1] if force.ndim == 3 else force[ids, 1][None]
+        return limits.expand(self.env.num_envs, -1).clone()
 
     def memory(self):
         env, motion = self.env, self.mdp.motion
@@ -280,7 +256,7 @@ class PenSimReader(SimReader):
             time=scalar(motion.time_steps),
             start=scalar(motion.trajectory_starts),
             end=scalar(motion.trajectory_ends),
-            limits=self.xi[:, self.mdp.limit_slice].clone(),
+            limits=self.torque_limits(),
             encoder_bias=self.robot.data.encoder_bias.clone(),
             frozen_target=act._targets.clone(),
             mask=act._mask_dofs.float().clone(),
@@ -364,7 +340,7 @@ class PenObservations:
     def __init__(self, reader):
         self.reader, self.mdp = reader, reader.mdp
         self.frame_dim = sum(self.base_terms.values())
-        # Charge/time/physical caps are exact task/controller metadata.
+        # FailureHead context retains task metadata beyond the upstream critic frame.
         self.context_dim = reader.xi.shape[-1] + self.frame_dim + 21
 
     def auxiliary(self):
@@ -395,9 +371,9 @@ class PenObservations:
             (self.frame(x, memory, auxiliary), memory["cage"], memory["time"] * self.mdp.dt, simulator_context), -1
         )
 
-    @staticmethod
-    def critic(context):
-        return context
+    def critic(self, context):
+        """Match wuji-mjlab's clean, single-frame critic observation and order."""
+        return context[..., : self.frame_dim]
 
     @staticmethod
     def dynamics(x, simulator_context, disturbance):

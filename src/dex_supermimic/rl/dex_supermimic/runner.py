@@ -378,7 +378,8 @@ class DexSuperMimicRunner:
                 c.final_state_weight * state_loss
                 + c.contact_weight * contact_loss
             )
-            tau = self.mdp.pd_torque(x, w["u"][:, j], simulator)
+            torque_kwargs = {"limits": memory["limits"]} if self.is_pen else {}
+            tau = self.mdp.pd_torque(x, w["u"][:, j], simulator, **torque_kwargs)
             _, cage, _ = self.reward_step(
                 x1,
                 memory,
@@ -563,7 +564,8 @@ class DexSuperMimicRunner:
                 x1, contact = self.step_wm(
                     x, u, self.wm_features(x, simulator, self.observations.disturbance(auxiliary))
                 )
-                tau = self.mdp.pd_torque(x, u, simulator)
+                torque_kwargs = {"limits": m["limits"]} if self.is_pen else {}
+                tau = self.mdp.pd_torque(x, u, simulator, **torque_kwargs)
                 r, cage, _ = self.reward_step(x1, m, a, target, contact.sigmoid(), tau, soft=True)
                 # Original termination reads the PRE-reward counter.
                 if self.is_pen:

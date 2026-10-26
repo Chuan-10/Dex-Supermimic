@@ -22,3 +22,7 @@ This product includes software developed by:
   Copyright (c) 2015-2018, Matt Zucker
 
 This NOTICE file is provided per the requirements of Apache License 2.0 §4(d).
+
+Dex SuperMimic adaptations include standalone packaged Hand 1/Hand 2 assets,
+shared SuperMimic task recipes, and task-aware training and playback.
+The Hand 1 asset loader and rig configuration are adapted from wuji-mjlab.

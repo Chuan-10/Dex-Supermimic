@@ -38,6 +38,7 @@ class SimReader:
             tag_r,
             round(1 / env.step_dt),
             getattr(data, "actuator_effort_limit", None),
+            cage_up_axis=env.reward_manager.get_term_cfg("cage_escape").params["up_axis"],
         )
         if self.mdp.effort_limit is not None:
             self.mdp.effort_limit = self.mdp.effort_limit[0].clone()

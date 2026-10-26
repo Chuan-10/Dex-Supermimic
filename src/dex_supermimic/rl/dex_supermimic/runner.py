@@ -16,6 +16,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task
+
 from .rotations import mv, quat_to_mat
 
 from .metrics import MetricLogger
@@ -449,6 +451,8 @@ class DexSuperMimicRunner:
     def load_model_only(self, path):
         """A/B starts actor, critic and optimizers fresh; source checkpoint is read-only."""
         state = torch.load(path, map_location=self.device, weights_only=False)
+        if checkpoint_task(state["config"]) != self.cfg.task:
+            raise ValueError("Model initialization task mismatch")
         if (
             state["format_version"] not in (2, 3)
             or state["joint_names"] != list(self.reader.robot.joint_names)
@@ -747,6 +751,8 @@ class DexSuperMimicRunner:
 
     def load(self, path):
         state = torch.load(path, map_location=self.device, weights_only=False)
+        if checkpoint_task(state["config"]) != self.cfg.task:
+            raise ValueError("Checkpoint task mismatch")
         if "utd" not in state["config"] or "critic_minibatches" not in state["config"]:
             raise ValueError(
                 "Checkpoint predates the SuperMimic training recipe. Start a fresh run, "

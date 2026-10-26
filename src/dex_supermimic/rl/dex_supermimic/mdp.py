@@ -31,7 +31,8 @@ def angle_error(r, goal):
 
 class DexMDP:
     def __init__(
-        self, kin, default, lower, upper, tag_pos, tag_rot, hz=50, effort_limit=None
+        self, kin, default, lower, upper, tag_pos, tag_rot, hz=50, effort_limit=None,
+        cage_up_axis=1,
     ):
         self.kin = kin
         self.default = default
@@ -52,6 +53,10 @@ class DexMDP:
         self.kd_default = None
         self.force_limit = None
         self.gear = None
+        if cage_up_axis not in (0, 1, 2):
+            raise ValueError("cage_up_axis must be 0, 1 or 2")
+        self.cage_margin = default.new_full((3,), 0.01)
+        self.cage_margin[cage_up_axis] = 0.03
         self.cage_ids = [
             i
             for i, n in enumerate(kin.names)
@@ -67,8 +72,7 @@ class DexMDP:
         kin = self.kin.forward(q, qd) if kin is None else kin
         points = kin[0][..., self.cage_ids, :]
         lo = points.amin(-2) - 0.01
-        margin = lo.new_tensor([0.01, 0.03, 0.01])
-        hi = points.amax(-2) + margin
+        hi = points.amax(-2) + self.cage_margin
         if soft:
             signed = torch.maximum(lo - p, p - hi).amax(-1, keepdim=True)
             outside = torch.sigmoid(signed / 0.002)

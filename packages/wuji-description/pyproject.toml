@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wuji-description"
 version = "0.1.0"
-description = "Pinned Wuji Hand 2 MJCF and mesh resources"
+description = "Pinned Wuji Hand 1 and Hand 2 MJCF and mesh resources"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 

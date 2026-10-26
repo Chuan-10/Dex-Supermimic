@@ -2,7 +2,7 @@
 
 ![Dex SuperMimic teaser](teaser.jpg)
 
-This repository reproduces [SuperMimic](https://supermimic.github.io/) on a dexterous hand, adapting its world-model-based training approach to in-hand cube reorientation with Wuji Hand 2. It is built on mjlab and MuJoCo Warp.
+This repository reproduces [SuperMimic](https://supermimic.github.io/) on dexterous hands, adapting its world-model-based training approach to in-hand cube reorientation with Wuji Hand 1 and Wuji Hand 2. It is built on mjlab and MuJoCo Warp.
 
 ## Download and Installation
 
@@ -32,6 +32,40 @@ uv run dex-supermimic-train --num-envs 1024 --device cuda:0
 ```
 
 This launches 1024 parallel environments on the first CUDA GPU. Training logs and checkpoints are saved to `logs/dex_supermimic/<timestamp>/`.
+
+Wuji Hand 1 cube reorientation uses the same SuperMimic world-model and
+imagination training pipeline, with the original Hand 1 model, soft thumb pad,
+initial grasp, wrist-tag frame, contact sensors, and palm cage axis:
+
+```bash
+uv run dex-supermimic-train --task hand1-reorient --num-envs 1024 --device cuda:0
+```
+
+Hand 1 runs are saved to `logs/dex_supermimic/hand1-reorient/<timestamp>/`.
+Both hands support `--control-hz 20` and `--control-hz 50` (default).
+Playback and evaluation select the hand from the checkpoint automatically:
+
+```bash
+uv run dex-supermimic-play --checkpoint logs/dex_supermimic/hand1-reorient/<timestamp>/model_final.pt
+```
+
+The default task remains `hand2-reorient`; older checkpoints without a task
+field are read as Hand 2. Checkpoints cannot be resumed or used for world-model
+initialization across different hands. Hand 1 assets are bundled by `uv sync`;
+the `thirdparty/wuji-mjlab` checkout is only a porting reference.
+
+Run the task-selection and packaged-model checks, plus CUDA simulator checks
+for both hands at both frequencies, with:
+
+```bash
+uv run python -m unittest discover -s tests/dex_supermimic -v
+```
+
+CUDA checks cover observation reconstruction, differentiable fingertip
+kinematics, cage faces, and rewards independent of stale body kinematics.
+MuJoCo Warp simulator checks are skipped when CUDA is unavailable.
+Hand 1 has passed a small training/resume/playback smoke run; a converged
+Hand 1 policy and success-rate reproduction have not yet been validated.
 
 Training logs locally with TensorBoard by default. To use Weights & Biases, append `--logger wandb`; to disable logging, append `--logger none`.
 

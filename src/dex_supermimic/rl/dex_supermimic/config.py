@@ -3,9 +3,13 @@
 import math
 from dataclasses import dataclass, asdict
 
+from dex_supermimic.tasks.dex_reorient.config.task import DEFAULT_TASK, TaskName
+
 
 @dataclass(kw_only=True)
 class DexSuperMimicCfg:
+    task: TaskName = DEFAULT_TASK
+    """Robot/task to train. Existing checkpoints default to Hand 2."""
     seed: int = 42
     logger: str = "tensorboard"
     """Metric backend: wandb, tensorboard, or none (default tensorboard)."""
@@ -66,6 +70,8 @@ class DexSuperMimicCfg:
     checkpoint: str | None = None
 
     def __post_init__(self):
+        if self.task not in ("hand1-reorient", "hand2-reorient"):
+            raise ValueError(f"Unknown task: {self.task!r}")
         if self.logger not in ("wandb", "tensorboard", "none"):
             raise ValueError("logger must be wandb, tensorboard, or none")
         if self.logger != "wandb" and self.wandb_mode is not None:

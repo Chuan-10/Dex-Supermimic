@@ -25,7 +25,6 @@ from .diagnostics import (
     GROUPS,
     HorizonGate,
     evaluate_world_model,
-    grouped_loss,
     load_dataset,
     transition_strata,
     validate_action_horizon,
@@ -65,7 +64,7 @@ def format_training_log(iteration, max_iterations, stats):
             f"  {'Metric':<20} {'Train':>16} {'Holdout':>16}",
         ]
     )
-    for key in ("wm_loss", "state_error", "failure_loss", "failure_brier"):
+    for key in ("wm_loss", "failure_loss"):
         train = f"{stats[key]:.6g}" if key in stats else "--"
         holdout_key = f"holdout/{key}"
         holdout = f"{stats[holdout_key]:.6g}" if holdout_key in stats else "--"
@@ -402,25 +401,18 @@ class DexSuperMimicRunner:
             self.wm.norm.update(self.wm.inputs(initial_dynamics, w["u"][:, 0]))
             self.wm.delta_norm.update(difference(w["x"], w["x1"])[w["mask"].bool()])
         x = w["x"][:, 0]
-        preds = []
         losses = []
         failure_features = []
         std = torch.maximum(self.wm.delta_norm.std(), self.wm.error_floor)
-        group_metrics = {}
         for j in range(window):
             dynamics = self.wm_features(x, simulator, auxiliary[:, 12:21])
             x1, contact = self.step_wm(x, w["u"][:, j], dynamics)
-            state_loss, final_groups = grouped_loss(x1, w["x1"][:, j], c.state_scales, c.state_weights)
             state_loss = (difference(x1, w["x1"][:, j]) / std).square().mean(-1)
-            for k, name in enumerate(GROUPS):
-                group_metrics.setdefault(f"loss/final/{name}", []).append(final_groups[:, k].detach())
             contact_loss = F.binary_cross_entropy_with_logits(contact, w["contact"][:, j], reduction="none").sum(-1)
-            group_metrics.setdefault("loss/contact", []).append(contact_loss.detach())
             losses.append(
                 c.final_state_weight * state_loss
                 + c.contact_weight * contact_loss
             )
-            preds.append(state_loss.detach())
             tau = self.mdp.pd_torque(x, w["u"][:, j], simulator)
             _, cage, _ = self.reward_step(
                 x1,
@@ -465,21 +457,7 @@ class DexSuperMimicRunner:
         if not holdout:
             self.optimize("wm", wm_loss)
             self.model_revision += 1
-        true = torch.stack(
-            [
-                self.fail_head.features(
-                    w["x1"][:, j],
-                    self.observations.context(
-                        w["x1"][:, j],
-                        unflatten_memory(w["m"][:, j]),
-                        w["aux"][:, j],
-                        simulator,
-                    ),
-                )
-                for j in range(window)
-            ],
-            1,
-        )
+        true = self.replay_failure_features(w, simulator)
         predicted = torch.stack(failure_features, 1).detach()
         if not holdout and c.variant == "legacy":
             self.fail_head.norm.update(true[w["mask"].bool()])
@@ -496,17 +474,25 @@ class DexSuperMimicRunner:
         ).sum() / (2 * denom)
         if not holdout:
             self.optimize("fail_head", failure_loss)
-        brier = ((failure_logit_pred.sigmoid() - label).square() * mask * w["importance"]).sum() / (
-            mask * w["importance"]
-        ).sum().clamp_min(1)
         return dict(
-            **{k: (torch.stack(v, 1) * mask).sum() / denom for k, v in group_metrics.items()},
             supervision_window=window,
             wm_loss=wm_loss.detach(),
             failure_loss=failure_loss.detach(),
-            failure_brier=brier.detach(),
-            state_error=torch.stack(preds, 1).mul(mask).sum() / denom,
         )
+
+    @torch.no_grad()
+    def replay_failure_features(self, w, simulator):
+        # Recorded states are independent across time. Batch B*T together so
+        # observation/FK kernels launch once rather than once per window step.
+        batch, window = w["x1"].shape[:2]
+        x = w["x1"].flatten(0, 1)
+        context = self.observations.context(
+            x,
+            unflatten_memory(w["m"].flatten(0, 1)),
+            w["aux"].flatten(0, 1),
+            simulator[:, None].expand(-1, window, -1).reshape(batch * window, -1),
+        )
+        return self.fail_head.features(x, context).reshape(batch, window, -1)
 
     def load_model_only(self, path):
         """A/B starts actor, critic and optimizers fresh; source checkpoint is read-only."""

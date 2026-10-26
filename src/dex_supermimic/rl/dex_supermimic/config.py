@@ -18,7 +18,7 @@ class DexSuperMimicCfg:
     device: str = "cuda:0"
     num_envs: int = 1024
     control_hz: int = 50
-    max_iterations: int = 320_000
+    max_iterations: int = 8_000
     buffer_steps: int = 1000
     warmup_steps: int = 64
     utd: float = 0.4

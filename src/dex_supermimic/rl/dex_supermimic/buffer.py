@@ -12,8 +12,10 @@ class ReplayBuffer:
         self.data = {}
         self.ptr = 0
         self.size = 0
+        self._failure_pools = {}
 
     def add(self, transition):
+        self._failure_pools.clear()
         if not self.data:
             self.data = {
                 k: torch.empty((self.capacity, *v.shape), device=self.device, dtype=v.dtype)
@@ -33,8 +35,10 @@ class ReplayBuffer:
             raise ValueError("No held-out environments")
         count = self.size - window + 1
         nenv = hi - lo
-        probability = torch.full((count * nenv,), 1 / (count * nenv), device=self.device)
+        total = count * nenv
+        probability = None
         if stratified_fraction and "stratum" in self.data:
+            probability = torch.full((total,), 1 / total, device=self.device)
             chronological = (self.ptr - self.size + torch.arange(self.size, device=self.device)) % self.capacity
             labels = self.data["stratum"][chronological, lo:hi]
             # A window belongs to every class encountered anywhere in the window.
@@ -47,24 +51,36 @@ class ReplayBuffer:
             balanced /= present.sum().clamp_min(1)
             if bool(present.any()):
                 probability = (1 - stratified_fraction) * probability + stratified_fraction * balanced
-        ids = torch.multinomial(probability, batch, replacement=True, generator=generator)
+        # Uniform integer sampling avoids building/scanning a million-entry CDF
+        # for each of the ten WM batches. The distribution is unchanged.
+        if probability is None:
+            ids = torch.randint(total, (batch,), device=self.device, generator=generator)
+        else:
+            ids = torch.multinomial(probability, batch, replacement=True, generator=generator)
+        importance = torch.ones(batch, device=self.device)
+        if probability is not None:
+            importance = 1 / (total * probability[ids])
         if failure_frac:
             if stratified_fraction:
                 raise ValueError("Choose failure-window or stratified sampling")
-            chronological = (self.ptr - self.size + torch.arange(self.size, device=self.device)) % self.capacity
-            term = self.data["terminated"][chronological, lo:hi].int()
-            cumulative = torch.nn.functional.pad(term.cumsum(0), (0, 0, 1, 0))
-            starts = torch.arange(count, device=self.device)
-            ends = (starts + failure_horizon).clamp(max=self.size)
-            failure = ((cumulative[ends] - cumulative[starts]) > 0).flatten()
-            n_failure = failure.sum()
+            key = (window, holdout, failure_horizon)
+            if key not in self._failure_pools:
+                chronological = (self.ptr - self.size + torch.arange(self.size, device=self.device)) % self.capacity
+                term = self.data["terminated"][chronological, lo:hi].int()
+                cumulative = torch.nn.functional.pad(term.cumsum(0), (0, 0, 1, 0))
+                starts = torch.arange(count, device=self.device)
+                ends = (starts + failure_horizon).clamp(max=self.size)
+                failure = ((cumulative[ends] - cumulative[starts]) > 0).flatten()
+                self._failure_pools[key] = (failure, failure.nonzero(as_tuple=True)[0])
+            failure, pool = self._failure_pools[key]
+            n_failure = pool.numel()
             n_draw = int(batch * failure_frac)
-            probs = torch.where(n_failure > 0, failure.float(), torch.ones_like(probability))
-            if n_draw:
-                ids[:n_draw] = torch.multinomial(probs, n_draw, replacement=True, generator=generator)
+            if n_draw and n_failure:
+                ids[:n_draw] = pool[torch.randint(n_failure, (n_draw,), device=self.device, generator=generator)]
             ids = ids[torch.randperm(batch, device=self.device, generator=generator)]
-            q = (n_draw / batch) * (n_failure > 0).float()
-            probability = (1 - q) * probability + q * failure.float() / n_failure.clamp_min(1)
+            q = n_draw / batch if n_failure else 0.0
+            selected_probability = (1 - q) / total + q * failure[ids].float() / max(n_failure, 1)
+            importance = 1 / (total * selected_probability)
         t, env = ids // nenv, ids % nenv + lo
         rows = (self.ptr - self.size + t[:, None] + torch.arange(window, device=self.device)) % self.capacity
         out = {k: v[rows, env[:, None]] for k, v in self.data.items()}
@@ -72,6 +88,6 @@ class ReplayBuffer:
         alive = torch.cat((torch.ones_like(out["done"][:, :1]), ~out["done"][:, :-1]), 1).float().cumprod(1)
         # An invalid state also poisons all later open-loop predictions.
         out["mask"] = alive * out["valid"].float().cumprod(1)
-        out["importance"] = (1 / (count * nenv * probability[ids]))[:, None].expand(-1, window)
+        out["importance"] = importance[:, None].expand(-1, window)
         out["env"] = env
         return out

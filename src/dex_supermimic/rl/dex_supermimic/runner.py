@@ -29,6 +29,19 @@ from .sim import SimReader
 from .state import difference, ema_target, flatten_memory, unflatten_memory
 
 
+WANDB_TASK_LABELS = {
+    "hand1-reorient": "hand1 reori",
+    "hand2-reorient": "hand2 reori",
+    "hand2-pen-spin": "pen spin",
+}
+
+
+def wandb_run_name(task: str, log_dir: str | Path) -> str:
+    """Build a concise W&B run name that starts with the task label."""
+    label = WANDB_TASK_LABELS.get(task, task)
+    return f"{label} {Path(log_dir).name}"
+
+
 def format_training_log(iteration, max_iterations, stats):
     """Format console metrics without changing TensorBoard scalar precision."""
     elapsed = int(stats["wall_seconds"])
@@ -121,6 +134,7 @@ class DexSuperMimicRunner:
             cfg.logger,
             log_dir=self.log_dir,
             config=cfg.to_dict(),
+            run_name=wandb_run_name(cfg.task, self.log_dir),
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
         )

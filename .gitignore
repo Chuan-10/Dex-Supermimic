@@ -51,3 +51,5 @@ webplay_hoi.py
 /thirdparty/
 # This OBJ is a MuJoCo model asset, not a compiled object file.
 !src/dex_supermimic/assets/resources/inhand_cube/meshes/*.obj
+# External pen-spin motion dataset (downloaded separately).
+/src/dex_supermimic/tasks/pen_spin/data/rawdata/

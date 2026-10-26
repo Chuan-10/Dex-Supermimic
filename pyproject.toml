@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dex-supermimic"
 version = "0.1.0"
-description = "Dex SuperMimic training and playback for Wuji Hand 1 and Hand 2 cube reorientation."
+description = "Dex SuperMimic training and playback for Wuji Hand 1 and Hand 2 cube reorientation and pen tracking."
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10,<3.14"
@@ -65,6 +65,10 @@ dex_supermimic = [
   "assets/resources/wuji_hand2/*.STL",
   "tasks/dex_reorient/LICENSE",
   "tasks/dex_reorient/NOTICE",
+  "assets/resources/aruco_pen250/**/*",
+  "tasks/pen_spin/data/recipe/*.json",
+  "tasks/pen_spin/LICENSE",
+  "tasks/pen_spin/NOTICE",
 ]
 
 [tool.black]

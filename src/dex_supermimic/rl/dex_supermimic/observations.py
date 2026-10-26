@@ -50,6 +50,10 @@ class TaskObservations:
         self.episode_steps = env.max_episode_length
         self.context_dim = reader.xi.shape[-1] + FRAME_DIM
 
+    @staticmethod
+    def disturbance(auxiliary):
+        return auxiliary[:, 12:21]
+
     def auxiliary(self):
         """Exogenous metadata, stored per transition, never inferred from env IDs."""
         reader = self.reader

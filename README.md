@@ -2,7 +2,7 @@
 
 ![Dex SuperMimic teaser](teaser.jpg)
 
-This repository reproduces [SuperMimic](https://supermimic.github.io/) on dexterous hands, adapting its world-model-based training approach to in-hand cube reorientation with Wuji Hand 1 and Wuji Hand 2. It is built on mjlab and MuJoCo Warp.
+This repository reproduces [SuperMimic](https://supermimic.github.io/) on dexterous hands, adapting its world-model-based training approach to in-hand cube reorientation with Wuji Hand 1 and Wuji Hand 2, and reference-based pen spinning with Wuji Hand 2. It is built on mjlab and MuJoCo Warp.
 
 ## Download and Installation
 
@@ -21,7 +21,7 @@ cd Dex-Supermimic
 uv sync
 ```
 
-`uv` creates the local Python environment and installs the project dependencies, including the bundled Wuji hand models and meshes. No separate motion dataset or asset download is required.
+`uv` creates the local Python environment and installs the project dependencies, including the bundled Wuji hand models and meshes. Cube reorientation needs no separate dataset. Pen spinning uses the motion download described below.
 
 ## Training
 
@@ -68,6 +68,31 @@ Hand 1 has passed a small training/resume/playback smoke run; a converged
 Hand 1 policy and success-rate reproduction have not yet been validated.
 
 Training logs locally with TensorBoard by default. To use Weights & Biases, append `--logger wandb`; to disable logging, append `--logger none`.
+
+## Pen spinning (Hand 2)
+
+Download the upstream motion catalog, then train with the same SuperMimic runner:
+
+```bash
+uv run python -m dex_supermimic.tasks.pen_spin.tooling.download
+uv run dex-supermimic-train --task hand2-pen-spin --num-envs 1024 --device cuda:0
+```
+
+The default recipe is continuous multi-axis rotation. Select another of the five
+packaged recipes with `--recipe-path src/dex_supermimic/tasks/pen_spin/data/recipe/01_single_axis.json`.
+Use `--clips-root /path/to/clips` for an external catalog. Pen spin requires 50 Hz.
+Logs are saved under `logs/dex_supermimic/hand2-pen-spin/<timestamp>/`.
+Playback selects the task and recipe from its checkpoint:
+
+```bash
+uv run dex-supermimic-play --checkpoint logs/dex_supermimic/hand2-pen-spin/<timestamp>/model_final.pt
+```
+
+Pen spin supports the standard Viser viewer, native viewer and headless playback;
+the cube-specific world-model ghost overlay is not used. The implementation has
+passed a small GPU training/resume smoke test; convergence has not been validated.
+See [the pen-spin recipe notes](src/dex_supermimic/rl/dex_supermimic/setting_hand2_pen_spin.md)
+for observation/controller details, validation and imagination approximations.
 
 ## Visualization
 

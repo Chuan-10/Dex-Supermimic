@@ -10,6 +10,10 @@ from dex_supermimic.tasks.dex_reorient.config.task import DEFAULT_TASK, TaskName
 class DexSuperMimicCfg:
     task: TaskName = DEFAULT_TASK
     """Robot/task to train. Existing checkpoints default to Hand 2."""
+    recipe_path: str | None = None
+    """Pen-spin motion recipe (defaults to continuous multi-axis)."""
+    clips_root: str | None = None
+    """External pen-spin clip catalog directory."""
     seed: int = 42
     logger: str = "tensorboard"
     """Metric backend: wandb, tensorboard, or none (default tensorboard)."""
@@ -70,8 +74,10 @@ class DexSuperMimicCfg:
     checkpoint: str | None = None
 
     def __post_init__(self):
-        if self.task not in ("hand1-reorient", "hand2-reorient"):
+        if self.task not in ("hand1-reorient", "hand2-reorient", "hand2-pen-spin"):
             raise ValueError(f"Unknown task: {self.task!r}")
+        if self.task == "hand2-pen-spin" and self.control_hz != 50:
+            raise ValueError("Pen spin requires 50 Hz reference playback")
         if self.logger not in ("wandb", "tensorboard", "none"):
             raise ValueError("logger must be wandb, tensorboard, or none")
         if self.logger != "wandb" and self.wandb_mode is not None:

@@ -21,14 +21,6 @@ from .rotations import mv, quat_to_mat
 from .metrics import MetricLogger
 from .buffer import ReplayBuffer
 from .common import RunningNorm
-from .diagnostics import (
-    GROUPS,
-    HorizonGate,
-    evaluate_world_model,
-    load_dataset,
-    transition_strata,
-    validate_action_horizon,
-)
 from .networks import Actor, Critic, FailureHead, WorldModel
 from .observations import BASE_TERMS, CURRENT_TERMS, TaskObservations
 from .sim import SimReader
@@ -69,29 +61,6 @@ def format_training_log(iteration, max_iterations, stats):
         holdout_key = f"holdout/{key}"
         holdout = f"{stats[holdout_key]:.6g}" if holdout_key in stats else "--"
         lines.append(f"  {key:<20} {train:>16} {holdout:>16}")
-    for horizon in (1, 4, 8, 16, 32):
-        base = f"diagnostics/h{horizon}/all/final/"
-        values = []
-        for group in GROUPS:
-            mean, p95 = base + group + "/mean", base + group + "/p95"
-            if mean in stats:
-                values.append(f"{group}={stats[mean]:.4g}/{stats[p95]:.4g}")
-        if values:
-            lines.append(f"Diagnostics h={horizon} (mean/p95):")
-            lines.extend("  " + "  |  ".join(values[j : j + 2]) for j in range(0, len(values), 2))
-    direction_keys = sorted(
-        {k.rsplit("/", 1)[0] for k in stats if k.startswith("direction/h") and k.endswith("/pairs")}
-    )
-    for base in direction_keys:
-        pairs = stats[base + "/pairs"]
-        reward_count = stats[base + "/reward_effective_pairs"]
-        angle_count = stats[base + "/angle_effective_pairs"]
-        lines.append(
-            f"Direction {base.split('/')[-1]}: "
-            f"reward={stats[base + '/reward_sign_agreement']:.1%} ({reward_count:.0f}/{pairs:.0f}), "
-            f"angle={stats[base + '/angle_sign_agreement']:.1%} ({angle_count:.0f}/{pairs:.0f}), "
-            f"passed={bool(stats[base + '/passed'])}"
-        )
     lines.append("=" * 72)
     return "\n".join(lines)
 
@@ -124,11 +93,6 @@ class DexSuperMimicRunner:
         self.wm = WorldModel(dynamics_dim, contact_dim, cfg.wm_hidden, cfg.amp).to(self.device)
         self.fail_head = FailureHead(context_dim).to(self.device)
         self.torque_norm = RunningNorm(20, eps=1e-3).to(self.device)
-        self.horizon_gate = HorizonGate()
-        self.model_revision = 0
-        self.validation = load_dataset(cfg.diagnostic_dataset, self.device) if cfg.diagnostic_dataset else None
-        self.validation_external = cfg.diagnostic_dataset is not None
-        self.validation_frozen = self.validation_external
         self.critic = Critic(self.observations.critic(initial_context).shape[-1], cfg.amp).to(self.device)
         self.optimizers = {
             name: torch.optim.Adam(module.parameters(), lr=cfg.lr) for name, module in self.modules().items()
@@ -266,7 +230,6 @@ class DexSuperMimicRunner:
             m = self.reader.memory()
             auxiliary = self.observations.auxiliary()
             context = self.observations.context(x, m, auxiliary, self.reader.xi)
-            previous_contact = self.reader.contact().clone()
             self.actor.norm.update(self.obs[torch.isfinite(self.obs).all(-1)])
             action = (self.actor(self.obs) + self.cfg.action_noise * torch.randn_like(m["a1"])).clamp(-1, 1)
             obs, reward, terminated, truncated, _ = self.env.step(action)
@@ -326,15 +289,6 @@ class DexSuperMimicRunner:
             self.buffer.add(
                 dict(
                     x=x,
-                    stratum=transition_strata(
-                        x,
-                        cap["physics"],
-                        cap["contact"],
-                        previous_contact,
-                        cap["drop"],
-                        m["cage"],
-                        self.mdp.max_outside,
-                    ),
                     x1=cap["physics"],
                     push=next_x - cap["physics"],
                     u=u,
@@ -347,7 +301,6 @@ class DexSuperMimicRunner:
                     torque=cap["torque"],
                     reward=reward,
                     done=done,
-                    drop=cap["drop"],
                     terminated=terminated,
                     valid=valid,
                 )
@@ -456,7 +409,6 @@ class DexSuperMimicRunner:
         wm_loss = (torch.stack(losses, 1) * mask).sum() / mask.shape[0]
         if not holdout:
             self.optimize("wm", wm_loss)
-            self.model_revision += 1
         true = self.replay_failure_features(w, simulator)
         predicted = torch.stack(failure_features, 1).detach()
         if not holdout and c.variant == "legacy":
@@ -515,44 +467,6 @@ class DexSuperMimicRunner:
                 norm.var.fill_(1.0)
                 norm.count.zero_()
                 norm._host_count = 0.0
-
-    def run_diagnostics(self):
-        maximum = max(self.cfg.diagnostic_horizons)
-        if not self.validation_frozen:
-            if not self.cfg.holdout_fraction or self.buffer.size < maximum:
-                return {"diagnostics/dataset_ready": 0}
-            generator = torch.Generator(device=self.device).manual_seed(self.cfg.diagnostic_seed + self.iteration)
-            candidate = self.buffer.sample(self.cfg.diagnostic_batch, maximum, True, 0.5, generator)
-            candidate["sim_context"] = self.reader.xi[candidate["env"]].clone()
-            if self.validation is None:
-                self.validation = {k: v.detach().clone() for k, v in candidate.items()}
-            else:
-                # Keep existing examples fixed; append only regimes not yet represented
-                # at the window start with an uninterrupted full-length rollout.
-                present = (self.validation["stratum"][:, 0] & self.validation["mask"][:, -1:].bool()).any(0)
-                needed = (candidate["stratum"][:, 0] & ~present).any(-1) & candidate["mask"][:, -1].bool()
-                if bool(needed.any()):
-                    for key in candidate:
-                        self.validation[key] = torch.cat(
-                            (self.validation[key], candidate[key][needed].detach().clone()), 0
-                        )
-            present = (self.validation["stratum"][:, 0] & self.validation["mask"][:, -1:].bool()).any(0)
-            self.validation_frozen = bool(present.all())
-            # Store metadata separately from batch-shaped tensors while assembling.
-            saved = {k: v.cpu() for k, v in self.validation.items()}
-            saved["control_hz"] = torch.tensor(self.cfg.control_hz)
-            torch.save(saved, self.log_dir / "validation.pt")
-        result = evaluate_world_model(self, self.validation, self.cfg.diagnostic_horizons)
-        for h in self.cfg.diagnostic_horizons:
-            if h <= self.validation["mask"].shape[1]:
-                covered = all(
-                    result.get(f"h{h}/{name}/count", 0) > 0
-                    for name in ("stationary", "moving", "contact_switch", "near_failure")
-                )
-                result[f"h{h}/coverage_complete"] = int(covered)
-        result["dataset_frozen"] = int(self.validation_frozen)
-        (self.log_dir / "diagnostics_latest.json").write_text(json.dumps(result, indent=2))
-        return {"diagnostics/" + k: v for k, v in result.items()}
 
     def optimize(self, name, loss):
         optimizer = self.optimizers[name]
@@ -718,19 +632,6 @@ class DexSuperMimicRunner:
             horizon=horizon,
         )
 
-    def validate_actor_horizons(self):
-        """Validate each candidate against the latest fitted WM before actor use."""
-        stats = {}
-        for horizon in self.cfg.actor_validation_horizons:
-            if horizon > self.cfg.max_horizon:
-                continue
-            revision = self.model_revision
-            evidence = validate_action_horizon(self, horizon)
-            passed = self.horizon_gate.record(horizon, revision, evidence)
-            stats.update({f"direction/h{horizon}/{k}": v for k, v in evidence.items()})
-            stats[f"direction/h{horizon}/passed"] = int(passed)
-        return stats
-
     def learn(self):
         start = self.started_at
         phase_times = {}
@@ -811,7 +712,6 @@ class DexSuperMimicRunner:
         state = dict(
             format_version=3,
             torque_norm=self.torque_norm.state_dict(),
-            model_revision=self.model_revision,
             config=self.cfg.to_dict(),
             iteration=self.iteration if next_iteration is None else next_iteration,
             sim_steps=self.sim_steps,
@@ -860,7 +760,6 @@ class DexSuperMimicRunner:
             raise ValueError("Checkpoint control frequency mismatch")
         if "torque_norm" in state:
             self.torque_norm.load_state_dict(state["torque_norm"])
-        self.model_revision = state.get("model_revision", 0)
         for k, mod in self.modules().items():
             mod.load_state_dict(state["modules"][k])
         for k, opt in self.optimizers.items():

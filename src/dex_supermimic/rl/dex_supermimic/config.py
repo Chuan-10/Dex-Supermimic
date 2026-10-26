@@ -28,16 +28,8 @@ class DexSuperMimicCfg:
     """Fixed multi-step world-model supervision window, matching SuperMimic."""
     wm_failure_frac: float = 0.25
     wm_failure_horizon: int = 16
-    state_scales: tuple[float, ...] = (0.003, 0.05, 0.001, 0.005, 0.02, 0.05)
-    state_weights: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-    """Physical-unit scales/weights for diagnostic group metrics only."""
     final_state_weight: float = 1.0
     contact_weight: float = 0.1
-    diagnostic_batch: int = 128
-    diagnostic_horizons: tuple[int, ...] = (1, 4, 8, 16, 32)
-    actor_validation_horizons: tuple[int, ...] = (4,)
-    diagnostic_seed: int = 1729
-    diagnostic_dataset: str | None = None
     model_checkpoint: str | None = None
     reset_model_statistics: bool = False
     variant: str = "fixed"
@@ -78,14 +70,6 @@ class DexSuperMimicCfg:
             raise ValueError("logger must be wandb, tensorboard, or none")
         if self.logger != "wandb" and self.wandb_mode is not None:
             raise ValueError("wandb_mode requires logger=wandb")
-        if not self.diagnostic_horizons or any(h < 1 for h in self.diagnostic_horizons):
-            raise ValueError("Positive diagnostic horizons required")
-        if not self.actor_validation_horizons or any(h < 1 for h in self.actor_validation_horizons):
-            raise ValueError("Positive actor validation horizons required")
-        if len(set(self.actor_validation_horizons)) != len(self.actor_validation_horizons):
-            raise ValueError("Actor validation horizons must be distinct")
-        if self.diagnostic_batch < 1:
-            raise ValueError("Positive diagnostic batch required")
         if any(
             v < 0 for v in (self.final_state_weight, self.contact_weight)
         ):
@@ -94,12 +78,8 @@ class DexSuperMimicCfg:
             raise ValueError("variant must be fixed or legacy")
         if self.checkpoint and self.model_checkpoint:
             raise ValueError("Choose resume or model-only initialization")
-        if len(self.state_weights) != 6 or len(self.state_scales) != 6:
-            raise ValueError("Six state groups are required")
-        if any(v <= 0 for v in self.state_scales) or any(v < 0 for v in self.state_weights):
-            raise ValueError("State scales must be positive and weights nonnegative")
-        if sum(self.state_weights) <= 0 or not 0 <= self.wm_failure_frac < 1:
-            raise ValueError("Invalid state weights or failure sampling mixture")
+        if not 0 <= self.wm_failure_frac < 1:
+            raise ValueError("Invalid failure sampling mixture")
         if not math.isfinite(self.utd) or not 0 < self.utd <= 1:
             raise ValueError("utd must be in (0, 1]")
         if self.lr <= 0 or not 0 < self.lr_final_ratio <= 1:

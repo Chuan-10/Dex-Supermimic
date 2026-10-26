@@ -14,7 +14,7 @@ context.json
 - simulator context、contact / termination 标签：`sim.py`
 - 物理状态、delta、SO(3) 积分：`state.py`
 - 网络组装、递归 rollout、训练更新：`runner.py`
-- 固定数据诊断：`diagnostics.py`
+- 仿真状态快照（实验评估）：`snapshot.py`
 - 仿真端 observation / reward / command 定义：`../dex_reorient/`
 
 ---
@@ -364,19 +364,6 @@ contact_weight     = 0.1
 
 `error_std` 使用真实采集状态增量的运行标准差，并逐维设置物理误差下限。
 最终 loss 对有效时间步求和、除以窗口数量，与 SuperMimic 一致；窗口固定为 8 步。
-
-物理状态诊断指标分为 6 组：
-
-```text
-q, qd, p, R, v, w
-```
-
-以下默认尺度和分组权重仅用于诊断，不影响 WM 优化目标：
-
-```text
-state_scales = (0.003, 0.05, 0.001, 0.005, 0.02, 0.05)
-state_weights = (1, 1, 1, 1, 1, 1)
-```
 
 ---
 
@@ -798,8 +785,6 @@ critic context
 WM dynamics context
 ```
 
-diagnostics 的 open-loop rollout 使用同一条递归链。
-
 ---
 
 ## 10. Policy imagination
@@ -864,9 +849,7 @@ torque                    MuJoCo actuator force，用于 parity 诊断
 reward                    simulator reward
 terminated                real termination label，FailureHead 使用
 done                      terminated | truncated，用于 replay mask
-drop                      cage_drop 标签，用于诊断 / strata
 valid                     finite/NaN mask
-stratum                   sampling stratum
 ```
 
 replay window 不跨越 episode boundary；invalid transition 会截断后续 open-loop prediction。

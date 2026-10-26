@@ -26,7 +26,7 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.capacity, self.size + 1)
 
-    def sample(self, batch, window=1, holdout=False, stratified_fraction=0.0, generator=None,
+    def sample(self, batch, window=1, holdout=False, generator=None,
                failure_frac=0.0, failure_horizon=16):
         if self.size < window:
             raise ValueError("Not enough replay steps")
@@ -36,33 +36,9 @@ class ReplayBuffer:
         count = self.size - window + 1
         nenv = hi - lo
         total = count * nenv
-        probability = None
-        if stratified_fraction and "stratum" in self.data:
-            probability = torch.full((total,), 1 / total, device=self.device)
-            chronological = (self.ptr - self.size + torch.arange(self.size, device=self.device)) % self.capacity
-            labels = self.data["stratum"][chronological, lo:hi]
-            # A window belongs to every class encountered anywhere in the window.
-            membership = labels.unfold(0, window, 1).any(-1).reshape(-1, 4)
-            present = membership.any(0)
-            balanced = torch.zeros_like(probability)
-            for category in range(4):
-                pool = membership[:, category].float()
-                balanced += pool / pool.sum().clamp_min(1)
-            balanced /= present.sum().clamp_min(1)
-            if bool(present.any()):
-                probability = (1 - stratified_fraction) * probability + stratified_fraction * balanced
-        # Uniform integer sampling avoids building/scanning a million-entry CDF
-        # for each of the ten WM batches. The distribution is unchanged.
-        if probability is None:
-            ids = torch.randint(total, (batch,), device=self.device, generator=generator)
-        else:
-            ids = torch.multinomial(probability, batch, replacement=True, generator=generator)
+        ids = torch.randint(total, (batch,), device=self.device, generator=generator)
         importance = torch.ones(batch, device=self.device)
-        if probability is not None:
-            importance = 1 / (total * probability[ids])
         if failure_frac:
-            if stratified_fraction:
-                raise ValueError("Choose failure-window or stratified sampling")
             key = (window, holdout, failure_horizon)
             if key not in self._failure_pools:
                 chronological = (self.ptr - self.size + torch.arange(self.size, device=self.device)) % self.capacity

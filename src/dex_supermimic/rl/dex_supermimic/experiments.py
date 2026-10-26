@@ -31,7 +31,7 @@ class ExperimentConfig:
 def evaluate_goal_reversal(env, reader, actor, steps=32):
     """Two closed-loop goal directions from identical physics/controller memory."""
     from types import SimpleNamespace
-    from .diagnostics import WarpTaskSnapshot
+    from .snapshot import WarpTaskSnapshot
     from .state import unpack
     from .rotations import mm, so3_exp, so3_log, mat_to_quat
 

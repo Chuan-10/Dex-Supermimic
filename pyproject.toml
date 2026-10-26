@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dex-supermimic"
+version = "0.1.0"
+description = "Dex SuperMimic training and playback for Wuji Hand 2 cube reorientation."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "tyro>=1.0.1",
+  "numpy>=1.24,<2.5",
+  "torch>=2.7.0",
+  "cloudpickle>=3.0",
+  "wandb>=0.22.3",
+  "tensorboard>=2.20.0",
+  "onnx>=1.16",
+  "warp-lang>=1.14.0",
+  "mujoco-warp~=3.11.0",
+  "mujoco~=3.11.0",
+  "mjlab==1.6.0",
+  "wuji-description",
+]
+
+[project.scripts]
+dex-supermimic-train = "dex_supermimic.rl.dex_supermimic.cli:train"
+dex-supermimic-play = "dex_supermimic.rl.dex_supermimic.cli:play"
+
+[tool.uv]
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[tool.uv.sources]
+wuji-description = { path = "packages/wuji-description" }
+mjlab = { git = "https://github.com/mujocolab/mjlab.git", tag = "v1.6.0" }
+warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dex_supermimic = [
+  "assets/resources/inhand_cube/**/*",
+  "assets/resources/wuji_hand2/*.STL",
+  "tasks/dex_reorient/LICENSE",
+  "tasks/dex_reorient/NOTICE",
+]
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+preview = true
+
+[tool.isort]
+atomic = true
+profile = "black"
+line_length = 120
+py_version = 310
+skip_glob = ["docs/*", "logs/*", "outputs/*", "videos/*"]
+group_by_package = true
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+known_firstparty = ["dex_supermimic"]
+known_thirdparty = ["mjlab", "mujoco"]

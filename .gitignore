@@ -1,0 +1,53 @@
+# Training/runtime logs
+# Legacy location; pretrained weights are distributed as Release attachments.
+/pretrained_checkpoint/*.pt
+logs/
+log/
+outputs/
+runs/
+wandb/
+videos/
+*.log
+*.out
+
+# Build metadata and generated native artifacts
+build/
+dist/
+obj/
+*.egg-info/
+dex_supermimic.egg-info/
+*.o
+*.obj
+
+.github/
+.venv/
+venv/
+.vscode/
+.pytest_cache/
+/tests/*
+!/tests/dex_supermimic/
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc.*
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+MUJOCO_LOG.TXT
+# Scratch analysis / diagnostics / cluster job scripts (not part of source)
+.humanize/
+/AGENTS.md
+ARCHITECTURE.md
+PERF_ANALYSIS_CPU_GPU_SYNC.md
+diag_fix_test.py
+check_ref*.py
+webplay_hoi.py
+*.slurm
+
+# Reference checkouts are not release dependencies.
+/thirdparty/
+# This OBJ is a MuJoCo model asset, not a compiled object file.
+!src/dex_supermimic/assets/resources/inhand_cube/meshes/*.obj

@@ -232,6 +232,47 @@ class PenSimReader(SimReader):
         self.xi = self.context()
         self.reward_snapshot = None
 
+    # Viser renders the world-model object folder as "pen", not the generic
+    # "object" label used by the original cube-reorientation task.
+    world_model_object_group = "pen"
+
+    def auxiliary_observations(self):
+        return PenObservations(self)
+
+    def context(self):
+        """Read pen DR without adding a privileged term to the clean critic.
+
+        Pen spin deliberately matches the upstream 301-dimensional critic and
+        therefore has no ``dr_params`` observation. Reconstruct the same
+        six-value summary directly from the model, using the same hand collision
+        geoms and pen body/geoms that this task's startup events randomize.
+        """
+        from mjlab.managers import SceneEntityCfg
+
+        from dex_supermimic.tasks.dex_reorient.mdp.observations import (
+            dr_params_privileged,
+        )
+
+        return self._context_from_dr_params(
+            dr_params_privileged(
+                self.env,
+                robot_cfg=SceneEntityCfg(
+                    "robot",
+                    geom_names=(
+                        r"^right_palm_collision$",
+                        r"^right_finger[1-5]_(link[1-4]|tip_sensor)_col$",
+                    ),
+                    actuator_names=(".*",),
+                    joint_names=(".*",),
+                ),
+                object_cfg=SceneEntityCfg(
+                    "object",
+                    body_names=("cube",),
+                    geom_names=("cube", "A_bottom", "A_top"),
+                ),
+            )
+        )
+
     def torque_limits(self):
         """Read controller metadata without adding it to the network context."""
         ids = self.robot.indexing.ctrl_ids.long()

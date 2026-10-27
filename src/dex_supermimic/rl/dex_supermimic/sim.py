@@ -164,14 +164,15 @@ class SimReader:
 
     def context(self):
         """Read the reference DR summary and actuator context used by all modules."""
+        dr_cfg = self.env.observation_manager.get_term_cfg("critic", "dr_params")
+        return self._context_from_dr_params(dr_cfg.func(self.env, **dr_cfg.params))
+
+    def _context_from_dr_params(self, dr_params):
+        """Concatenate a six-value DR summary with exact actuator gain ratios."""
         model = self.env.sim.model
         N = self.env.num_envs
         values = []
         self.context_names = []
-        # Include the complete reference-task DR summary. Its friction mean
-        # replaces the former vector of per-geom friction ratios.
-        dr_cfg = self.env.observation_manager.get_term_cfg("critic", "dr_params")
-        dr_params = dr_cfg.func(self.env, **dr_cfg.params)
         if dr_params.shape[-1] != len(DR_PARAM_NAMES):
             raise ValueError(
                 f"Expected {len(DR_PARAM_NAMES)} reference DR ratios, got "

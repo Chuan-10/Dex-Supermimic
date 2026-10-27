@@ -111,7 +111,7 @@ From the repository root, load the pretrained checkpoint in the Viser web viewer
 
 ```bash
 uv run dex-supermimic-play \
-  --checkpoint logs/dex_supermimic/pretrained/model_8000.pt
+  --checkpoint /home/motphys/supermimic-instinct/logs/dex_supermimic/hand1-reorient/2026-10-26_21-33-46/model_final.pt
 ```
 
 Playback uses Viser and one environment by default and runs until you press `Ctrl+C` (`--steps 0` is the default). Open the viewer URL printed in the terminal in your browser. To limit playback, pass a positive control-step count such as `--steps 2000`. Replace the checkpoint path to view your own trained policy.

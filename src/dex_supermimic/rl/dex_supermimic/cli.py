@@ -140,29 +140,27 @@ def play():
 
         object_cfg = env_cfg.scene.entities["object"]
         object_cfg.spec_fn = partial(object_cfg.spec_fn, viser=True)
-    if cfg.viser and not is_pen and checkpoint.get("format_version") == 3 and "wm" in checkpoint["modules"]:
+    if cfg.viser and checkpoint.get("format_version") == 3 and "wm" in checkpoint["modules"]:
         # Preserve the exact postphysics target/control on terminal transitions.
         # DexViserPlayViewer explicitly resets completed environments afterward.
         env_cfg.auto_reset = False
     env = ManagerBasedRlEnv(env_cfg, device=cfg.device)
     env.max_common_steps = cfg.steps
-    if cfg.viser and is_pen:
-        from mjlab.viewer import ViserPlayViewer
-        viewer = ViserPlayViewer(env, policy=lambda obs: actor(obs["policy"]))
-        try:
-            viewer.run(num_steps=cfg.steps or None)
-        finally:
-            viewer.close()
-            env.close()
-        return
     if cfg.viser:
         from .viser import DexViserPlayViewer
+
+        def make_reader(play_env):
+            from .pen import PenSimReader
+            from .sim import SimReader
+
+            return PenSimReader(play_env) if is_pen else SimReader(play_env)
 
         try:
             env.reset()
             viewer = DexViserPlayViewer(
                 env, policy=lambda obs: actor(obs["policy"]), checkpoint=checkpoint,
                 wm_horizon=cfg.wm_horizon, wm_opacity=cfg.wm_opacity,
+                make_reader=make_reader,
             )
             viewer.run(num_steps=cfg.steps or None)
         finally:

@@ -23,10 +23,11 @@ from .rotations import mv, quat_to_mat
 from .metrics import MetricLogger
 from .buffer import ReplayBuffer
 from .common import RunningNorm
+from .mdp import angle_error
 from .networks import Actor, Critic, FailureHead, WorldModel
 from .observations import BASE_TERMS, CURRENT_TERMS, DR_PARAM_NAMES, TaskObservations
 from .sim import SimReader
-from .state import difference, ema_target, flatten_memory, unflatten_memory
+from .state import difference, ema_target, flatten_memory, unflatten_memory, unpack
 
 
 WANDB_TASK_LABELS = {
@@ -34,6 +35,50 @@ WANDB_TASK_LABELS = {
     "hand2-reorient": "hand2 reori",
     "hand2-pen-spin": "pen spin",
 }
+
+
+LOG_SECTION_RENAMES = {
+    "wm_loss": "wm/wm_loss",
+    "reward": "wm/reward",
+    "reward_parity": "wm/reward_parity",
+    "failure_loss": "wm/failure_loss",
+    "state_loss": "wm/state_loss",
+    "survival": "wm/survival",
+    "contact_digit_loss": "wm/contact_digit_loss",
+    "actor_loss": "policy/actor_loss",
+    "critic_loss": "policy/critic_loss",
+    "drop_rate": "task/drop_rate",
+    "rot_error": "task/rot_error",
+    "finger_1_action": "task/finger_1_action",
+    "finger_2_action": "task/finger_2_action",
+    "finger_3_action": "task/finger_3_action",
+    "finger_4_action": "task/finger_4_action",
+    "finger_5_action": "task/finger_5_action",
+    "horizon": "training/horizon",
+    "lr": "training/lr",
+    "wall_seconds": "training/time",
+    "sim_steps": "training/collected_sim_steps",
+    "norm_count": "training/norm_count",
+    "delta_norm_count": "training/delta_norm_count",
+    "supervision_window": "training/supervision_window",
+}
+
+
+def organize_log_scalars(scalars, iteration):
+    """Group scalar history keys into the W&B sections used for training runs."""
+    organized = {}
+    for name, value in scalars.items():
+        if torch.is_tensor(value) and value.numel() != 1:
+            continue
+        if name.startswith("reward_parity/"):
+            name = "reward/" + name.split("/", 1)[1]
+        elif name.startswith("holdout/"):
+            name = "wm/holdout_" + name.split("/", 1)[1]
+        else:
+            name = LOG_SECTION_RENAMES.get(name, name)
+        organized[name] = float(value)
+    organized["training/iteration"] = iteration
+    return organized
 
 
 def wandb_run_name(task: str, log_dir: str | Path) -> str:
@@ -44,7 +89,7 @@ def wandb_run_name(task: str, log_dir: str | Path) -> str:
 
 def format_training_log(iteration, max_iterations, stats):
     """Format console metrics without changing TensorBoard scalar precision."""
-    elapsed = int(stats["wall_seconds"])
+    elapsed = int(stats["training/time"])
     hours, remainder = divmod(elapsed, 3600)
     minutes, seconds = divmod(remainder, 60)
     lines = [
@@ -52,12 +97,28 @@ def format_training_log(iteration, max_iterations, stats):
         "=" * 72,
         f"Iteration {iteration:,} / {max_iterations:,}"
         f"  |  Time {hours:02d}:{minutes:02d}:{seconds:02d}"
-        f"  |  Steps {stats['sim_steps']:,.0f}",
+        f"  |  Steps {stats['training/collected_sim_steps']:,.0f}",
         "-" * 72,
     ]
     groups = (
-        ("Rollout", ("reward", "reward_parity", "drop_rate")),
-        ("Policy", ("actor_loss", "critic_loss", "survival", "horizon")),
+        (
+            "Rollout",
+            (
+                "wm/reward",
+                "wm/reward_parity",
+                "task/drop_rate",
+                "task/rot_error",
+            ),
+        ),
+        (
+            "Policy",
+            (
+                "policy/actor_loss",
+                "policy/critic_loss",
+                "wm/survival",
+                "training/horizon",
+            ),
+        ),
     )
     for title, keys in groups:
         values = [f"{key}={stats[key]:.6g}" for key in keys if key in stats]
@@ -71,9 +132,14 @@ def format_training_log(iteration, max_iterations, stats):
             f"  {'Metric':<20} {'Train':>16} {'Holdout':>16}",
         ]
     )
-    for key in ("wm_loss", "failure_loss"):
-        train = f"{stats[key]:.6g}" if key in stats else "--"
-        holdout_key = f"holdout/{key}"
+    for key in (
+        "wm_loss",
+        "failure_loss",
+        "state_loss",
+        "contact_digit_loss",
+    ):
+        train = f"{stats['wm/' + key]:.6g}" if "wm/" + key in stats else "--"
+        holdout_key = "wm/holdout_" + key
         holdout = f"{stats[holdout_key]:.6g}" if holdout_key in stats else "--"
         lines.append(f"  {key:<20} {train:>16} {holdout:>16}")
     lines.append("=" * 72)
@@ -119,6 +185,21 @@ class DexSuperMimicRunner:
         self.fail_head = FailureHead(context_dim).to(self.device)
         self.torque_norm = RunningNorm(20, eps=1e-3).to(self.device)
         self.critic = Critic(self.observations.critic(initial_context).shape[-1], cfg.amp).to(self.device)
+        self.finger_action_ids = torch.stack(
+            [
+                torch.tensor(
+                    [
+                        i
+                        for i, name in enumerate(self.reader.robot.joint_names)
+                        if name.endswith(f"finger{finger}_joint{joint}")
+                    ],
+                    device=self.device,
+                )
+                for finger in range(1, 6)
+                for joint in range(1, 5)
+            ],
+            -1,
+        ).reshape(5, 4)
         self.optimizers = {
             name: torch.optim.Adam(module.parameters(), lr=cfg.lr) for name, module in self.modules().items()
         }
@@ -250,6 +331,8 @@ class DexSuperMimicRunner:
         term_gaps = {}
         rewards = []
         drops = []
+        rotation_errors = []
+        finger_actions = []
         for _ in range(steps):
             self.reader.refresh_frame()
             x = self.reader.state()
@@ -337,6 +420,17 @@ class DexSuperMimicRunner:
                 cap["physics"], m, action, c, cap["contact"], cap["torque"]
             )
             denom = valid.float().sum().clamp_min(1)
+            rotation_errors.append(
+                torch.where(
+                    valid,
+                    angle_error(unpack(cap["physics"])[3], m["goal"].reshape(-1, 3, 3)),
+                    0.0,
+                ).sum()
+                / denom
+            )
+            finger_actions.append(
+                torch.where(valid[:, None], action, 0.0)[:, self.finger_action_ids].mean(0)
+            )
             for name, value in analytic_terms.items():
                 error = (value - cap["terms"][name]).abs()
                 term_gaps.setdefault(name, []).append(torch.where(valid, error, 0.0).sum() / denom)
@@ -358,6 +452,11 @@ class DexSuperMimicRunner:
             reward=torch.stack(rewards).mean(),
             reward_parity=torch.stack(gaps).mean(),
             drop_rate=torch.stack(drops).mean(),
+            rot_error=torch.stack(rotation_errors).mean(),
+            **{
+                "finger_" + str(i + 1) + "_action": value
+                for i, value in enumerate(torch.stack(finger_actions).mean(0))
+            },
         )
 
     def fit_world_model(self, holdout=False):
@@ -381,6 +480,8 @@ class DexSuperMimicRunner:
             self.wm.delta_norm.update(difference(w["x"], w["x1"])[w["mask"].bool()])
         x = w["x"][:, 0]
         losses = []
+        state_losses = []
+        contact_losses = []
         failure_features = []
         std = torch.maximum(self.wm.delta_norm.std(), self.wm.error_floor)
         for j in range(window):
@@ -392,6 +493,8 @@ class DexSuperMimicRunner:
                 c.final_state_weight * state_loss
                 + c.contact_weight * contact_loss
             )
+            state_losses.append(state_loss)
+            contact_losses.append(contact_loss)
             torque_kwargs = {"limits": memory["limits"]} if self.is_pen else {}
             tau = self.mdp.pd_torque(x, w["u"][:, j], simulator, **torque_kwargs)
             _, cage, _ = self.reward_step(
@@ -432,6 +535,8 @@ class DexSuperMimicRunner:
         mask = w["mask"]
         denom = mask.sum().clamp_min(1)
         wm_loss = (torch.stack(losses, 1) * mask).sum() / mask.shape[0]
+        state_component = (torch.stack(state_losses, 1) * mask).sum() / denom
+        contact_component = (torch.stack(contact_losses, 1) * mask).sum() / denom
         if not holdout:
             self.optimize("wm", wm_loss)
         true = self.replay_failure_features(w, simulator)
@@ -455,6 +560,8 @@ class DexSuperMimicRunner:
             supervision_window=window,
             wm_loss=wm_loss.detach(),
             failure_loss=failure_loss.detach(),
+            state_loss=state_component.detach(),
+            contact_digit_loss=contact_component.detach(),
         )
 
     @torch.no_grad()
@@ -729,10 +836,9 @@ class DexSuperMimicRunner:
                     wall_seconds=self.wall_offset + time.perf_counter() - start,
                     sim_steps=self.sim_steps,
                 )
-                scalar = {k: float(v) for k, v in stats.items()}
                 if self.cfg.profile:
                     elapsed = max(sum(phase_times.values()), 1e-12)
-                    scalar.update(
+                    stats.update(
                         {
                             **{f"profile/seconds/{k}": v for k, v in phase_times.items()},
                             **{f"profile/calls/{k}": v for k, v in phase_counts.items()},
@@ -742,6 +848,7 @@ class DexSuperMimicRunner:
                             },
                         }
                     )
+                scalar = organize_log_scalars(stats, it)
                 self.writer.log_scalars(scalar, it)
                 print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
             if (it + 1) % self.cfg.save_interval == 0:

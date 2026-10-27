@@ -16,20 +16,80 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task
+
 from .rotations import mv, quat_to_mat
 
 from .metrics import MetricLogger
 from .buffer import ReplayBuffer
 from .common import RunningNorm
+from .mdp import angle_error
 from .networks import Actor, Critic, FailureHead, WorldModel
-from .observations import BASE_TERMS, CURRENT_TERMS, TaskObservations
+from .observations import BASE_TERMS, CURRENT_TERMS, DR_PARAM_NAMES, TaskObservations
 from .sim import SimReader
-from .state import difference, ema_target, flatten_memory, unflatten_memory
+from .state import difference, ema_target, flatten_memory, unflatten_memory, unpack
+
+
+WANDB_TASK_LABELS = {
+    "hand1-reorient": "hand1 reori",
+    "hand2-reorient": "hand2 reori",
+    "hand2-pen-spin": "pen spin",
+}
+
+
+LOG_SECTION_RENAMES = {
+    "wm_loss": "wm/wm_loss",
+    "reward": "wm/reward",
+    "reward_parity": "wm/reward_parity",
+    "failure_loss": "wm/failure_loss",
+    "state_loss": "wm/state_loss",
+    "survival": "wm/survival",
+    "contact_digit_loss": "wm/contact_digit_loss",
+    "actor_loss": "policy/actor_loss",
+    "critic_loss": "policy/critic_loss",
+    "drop_rate": "task/drop_rate",
+    "rot_error": "task/rot_error",
+    "finger_1_action": "task/finger_1_action",
+    "finger_2_action": "task/finger_2_action",
+    "finger_3_action": "task/finger_3_action",
+    "finger_4_action": "task/finger_4_action",
+    "finger_5_action": "task/finger_5_action",
+    "horizon": "training/horizon",
+    "lr": "training/lr",
+    "wall_seconds": "training/time",
+    "sim_steps": "training/collected_sim_steps",
+    "norm_count": "training/norm_count",
+    "delta_norm_count": "training/delta_norm_count",
+    "supervision_window": "training/supervision_window",
+}
+
+
+def organize_log_scalars(scalars, iteration):
+    """Group scalar history keys into the W&B sections used for training runs."""
+    organized = {}
+    for name, value in scalars.items():
+        if torch.is_tensor(value) and value.numel() != 1:
+            continue
+        if name.startswith("reward_parity/"):
+            name = "reward/" + name.split("/", 1)[1]
+        elif name.startswith("holdout/"):
+            name = "wm/holdout_" + name.split("/", 1)[1]
+        else:
+            name = LOG_SECTION_RENAMES.get(name, name)
+        organized[name] = float(value)
+    organized["training/iteration"] = iteration
+    return organized
+
+
+def wandb_run_name(task: str, log_dir: str | Path) -> str:
+    """Build a concise W&B run name that starts with the task label."""
+    label = WANDB_TASK_LABELS.get(task, task)
+    return f"{label} {Path(log_dir).name}"
 
 
 def format_training_log(iteration, max_iterations, stats):
     """Format console metrics without changing TensorBoard scalar precision."""
-    elapsed = int(stats["wall_seconds"])
+    elapsed = int(stats["training/time"])
     hours, remainder = divmod(elapsed, 3600)
     minutes, seconds = divmod(remainder, 60)
     lines = [
@@ -37,12 +97,28 @@ def format_training_log(iteration, max_iterations, stats):
         "=" * 72,
         f"Iteration {iteration:,} / {max_iterations:,}"
         f"  |  Time {hours:02d}:{minutes:02d}:{seconds:02d}"
-        f"  |  Steps {stats['sim_steps']:,.0f}",
+        f"  |  Steps {stats['training/collected_sim_steps']:,.0f}",
         "-" * 72,
     ]
     groups = (
-        ("Rollout", ("reward", "reward_parity", "drop_rate")),
-        ("Policy", ("actor_loss", "critic_loss", "survival", "horizon")),
+        (
+            "Rollout",
+            (
+                "wm/reward",
+                "wm/reward_parity",
+                "task/drop_rate",
+                "task/rot_error",
+            ),
+        ),
+        (
+            "Policy",
+            (
+                "policy/actor_loss",
+                "policy/critic_loss",
+                "wm/survival",
+                "training/horizon",
+            ),
+        ),
     )
     for title, keys in groups:
         values = [f"{key}={stats[key]:.6g}" for key in keys if key in stats]
@@ -56,9 +132,14 @@ def format_training_log(iteration, max_iterations, stats):
             f"  {'Metric':<20} {'Train':>16} {'Holdout':>16}",
         ]
     )
-    for key in ("wm_loss", "failure_loss"):
-        train = f"{stats[key]:.6g}" if key in stats else "--"
-        holdout_key = f"holdout/{key}"
+    for key in (
+        "wm_loss",
+        "failure_loss",
+        "state_loss",
+        "contact_digit_loss",
+    ):
+        train = f"{stats['wm/' + key]:.6g}" if "wm/" + key in stats else "--"
+        holdout_key = "wm/holdout_" + key
         holdout = f"{stats[holdout_key]:.6g}" if holdout_key in stats else "--"
         lines.append(f"  {key:<20} {train:>16} {holdout:>16}")
     lines.append("=" * 72)
@@ -73,14 +154,24 @@ class DexSuperMimicRunner:
         if torch.distributed.is_initialized():
             raise ValueError("DexSuperMimic currently supports one GPU/process")
         self.obs = env.reset()[0]["policy"]
-        self.reader = SimReader(env)
+        self.is_pen = cfg.task == "hand2-pen-spin"
+        self.flatten_memory = flatten_memory
+        self.unflatten_memory = unflatten_memory
+        if self.is_pen:
+            from .pen import PenSimReader, PenObservations, flatten_pen_memory, unflatten_pen_memory
+            self.flatten_memory = flatten_pen_memory
+            self.unflatten_memory = unflatten_pen_memory
+            self.history_from_obs = lambda obs: obs[:, None]
+            self.reader = PenSimReader(env)
+        else:
+            self.reader = SimReader(env)
         self.mdp = self.reader.mdp
-        self.observations = TaskObservations(self.reader)
+        self.observations = PenObservations(self.reader) if self.is_pen else TaskObservations(self.reader)
         initial_context = self.observations.context(
             self.reader.state(), self.reader.memory(), self.observations.auxiliary(), self.reader.xi
         )
         initial_dynamics = self.observations.dynamics(
-            self.reader.state(), self.reader.xi, self.observations.auxiliary()[:, 12:21]
+            self.reader.state(), self.reader.xi, self.observations.disturbance(self.observations.auxiliary())
         )
         self.reader.attach_capture()
         self.actor = Actor(self.obs.shape[-1]).to(self.device)
@@ -94,6 +185,21 @@ class DexSuperMimicRunner:
         self.fail_head = FailureHead(context_dim).to(self.device)
         self.torque_norm = RunningNorm(20, eps=1e-3).to(self.device)
         self.critic = Critic(self.observations.critic(initial_context).shape[-1], cfg.amp).to(self.device)
+        self.finger_action_ids = torch.stack(
+            [
+                torch.tensor(
+                    [
+                        i
+                        for i, name in enumerate(self.reader.robot.joint_names)
+                        if name.endswith(f"finger{finger}_joint{joint}")
+                    ],
+                    device=self.device,
+                )
+                for finger in range(1, 6)
+                for joint in range(1, 5)
+            ],
+            -1,
+        ).reshape(5, 4)
         self.optimizers = {
             name: torch.optim.Adam(module.parameters(), lr=cfg.lr) for name, module in self.modules().items()
         }
@@ -109,6 +215,7 @@ class DexSuperMimicRunner:
             cfg.logger,
             log_dir=self.log_dir,
             config=cfg.to_dict(),
+            run_name=wandb_run_name(cfg.task, self.log_dir),
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
         )
@@ -157,14 +264,14 @@ class DexSuperMimicRunner:
         (self.log_dir / "environment_config.pkl").write_bytes(cloudpickle.dumps(env.cfg))
         (self.log_dir / "context.json").write_text(json.dumps(self.reader.context_names, indent=2))
         layout = {
-            "base_terms": BASE_TERMS,
-            "current_terms": CURRENT_TERMS,
+            "base_terms": self.observations.base_terms if self.is_pen else BASE_TERMS,
+            "current_terms": {} if self.is_pen else CURRENT_TERMS,
             "wm_history": 1,
             "critic_history": 1,
             "wm_input_dim": self.wm.norm.mean.numel(),
             "critic_input_dim": self.critic.norm.mean.numel(),
             "dynamics_input_dim": dynamics_dim,
-            "dr_params": ["object_mass_ratio", "joint_damping_ratio", "object_size_ratio"],
+            "dr_params": [] if self.is_pen else list(DR_PARAM_NAMES),
             "wm_extra_terms": {"control_target": 20},
             "simulator_context": self.reader.context_names,
         }
@@ -179,7 +286,7 @@ class DexSuperMimicRunner:
     def replay_dynamics(self, w, x, j):
         """Dynamics features from predicted state; only startup/exogenous context is replayed."""
         simulator = w["sim_context"] if "sim_context" in w else self.reader.xi[w["env"]]
-        return self.wm_features(x, simulator, w["aux"][:, j, 12:21])
+        return self.wm_features(x, simulator, self.observations.disturbance(w["aux"][:, j]))
 
     def advance_memory(self, x1, memory, action, target, cage, next_goal, soft=True):
         """Advance task/controller state entirely from the imagined transition."""
@@ -224,6 +331,8 @@ class DexSuperMimicRunner:
         term_gaps = {}
         rewards = []
         drops = []
+        rotation_errors = []
+        finger_actions = []
         for _ in range(steps):
             self.reader.refresh_frame()
             x = self.reader.state()
@@ -235,7 +344,7 @@ class DexSuperMimicRunner:
             obs, reward, terminated, truncated, _ = self.env.step(action)
             cap = self.reader.reward_snapshot
             c = self.env.action_manager.get_term("joint_pos").processed_action.clone()
-            u = c - self.reader.robot.data.encoder_bias
+            u = self.reader.executed_target() if self.is_pen else c - self.reader.robot.data.encoder_bias
             next_x = self.reader.state()
             valid = (
                 (~cap["nan"])
@@ -244,7 +353,7 @@ class DexSuperMimicRunner:
             )
             valid = valid & torch.isfinite(cap["contact"]).all(-1) & torch.isfinite(cap["torque"]).all(-1)
             valid &= torch.isfinite(u).all(-1) & torch.isfinite(c).all(-1)
-            valid &= torch.isfinite(action).all(-1) & torch.isfinite(flatten_memory(m)).all(-1)
+            valid &= torch.isfinite(action).all(-1) & torch.isfinite(self.flatten_memory(m)).all(-1)
             valid &= torch.isfinite(next_x).all(-1) & torch.isfinite(self.obs).all(-1)
             valid &= torch.isfinite(context).all(-1)
             # Held-out environments never contribute to training statistics.
@@ -253,7 +362,7 @@ class DexSuperMimicRunner:
             self.torque_norm.update(cap["torque"][train_valid])
             if self.cfg.variant == "fixed":
                 dynamics = self.observations.dynamics(
-                    x[train_valid], self.reader.xi[train_valid], auxiliary[train_valid, 12:21]
+                    x[train_valid], self.reader.xi[train_valid], self.observations.disturbance(auxiliary[train_valid])
                 )
                 self.wm.norm.update(self.wm.inputs(dynamics, u[train_valid]))
                 self.wm.delta_norm.update(difference(x[train_valid], cap["physics"][train_valid]))
@@ -294,7 +403,7 @@ class DexSuperMimicRunner:
                     u=u,
                     c=c,
                     action=action,
-                    m=flatten_memory(m),
+                    m=self.flatten_memory(m),
                     obs=self.obs,
                     aux=auxiliary,
                     contact=cap["contact"],
@@ -311,6 +420,17 @@ class DexSuperMimicRunner:
                 cap["physics"], m, action, c, cap["contact"], cap["torque"]
             )
             denom = valid.float().sum().clamp_min(1)
+            rotation_errors.append(
+                torch.where(
+                    valid,
+                    angle_error(unpack(cap["physics"])[3], m["goal"].reshape(-1, 3, 3)),
+                    0.0,
+                ).sum()
+                / denom
+            )
+            finger_actions.append(
+                torch.where(valid[:, None], action, 0.0)[:, self.finger_action_ids].mean(0)
+            )
             for name, value in analytic_terms.items():
                 error = (value - cap["terms"][name]).abs()
                 term_gaps.setdefault(name, []).append(torch.where(valid, error, 0.0).sum() / denom)
@@ -332,6 +452,11 @@ class DexSuperMimicRunner:
             reward=torch.stack(rewards).mean(),
             reward_parity=torch.stack(gaps).mean(),
             drop_rate=torch.stack(drops).mean(),
+            rot_error=torch.stack(rotation_errors).mean(),
+            **{
+                "finger_" + str(i + 1) + "_action": value
+                for i, value in enumerate(torch.stack(finger_actions).mean(0))
+            },
         )
 
     def fit_world_model(self, holdout=False):
@@ -342,23 +467,25 @@ class DexSuperMimicRunner:
             failure_frac=0.0 if holdout or c.variant == "legacy" else c.wm_failure_frac,
             failure_horizon=c.wm_failure_horizon,
         )
-        memory = unflatten_memory(w["m"][:, 0])
+        memory = self.unflatten_memory(w["m"][:, 0])
         auxiliary = w["aux"][:, 0]
         simulator = w["sim_context"] if "sim_context" in w else self.reader.xi[w["env"]]
         if not holdout and c.variant == "legacy":
             # Deliberately reproduce the old WM statistics bug in the control arm.
             # The fixed arm never updates statistics from replay.
             initial_dynamics = self.observations.dynamics(
-                w["x"][:, 0], simulator, w["aux"][:, 0, 12:21]
+                w["x"][:, 0], simulator, self.observations.disturbance(w["aux"][:, 0])
             )
             self.wm.norm.update(self.wm.inputs(initial_dynamics, w["u"][:, 0]))
             self.wm.delta_norm.update(difference(w["x"], w["x1"])[w["mask"].bool()])
         x = w["x"][:, 0]
         losses = []
+        state_losses = []
+        contact_losses = []
         failure_features = []
         std = torch.maximum(self.wm.delta_norm.std(), self.wm.error_floor)
         for j in range(window):
-            dynamics = self.wm_features(x, simulator, auxiliary[:, 12:21])
+            dynamics = self.wm_features(x, simulator, self.observations.disturbance(auxiliary))
             x1, contact = self.step_wm(x, w["u"][:, j], dynamics)
             state_loss = (difference(x1, w["x1"][:, j]) / std).square().mean(-1)
             contact_loss = F.binary_cross_entropy_with_logits(contact, w["contact"][:, j], reduction="none").sum(-1)
@@ -366,7 +493,10 @@ class DexSuperMimicRunner:
                 c.final_state_weight * state_loss
                 + c.contact_weight * contact_loss
             )
-            tau = self.mdp.pd_torque(x, w["u"][:, j], simulator)
+            state_losses.append(state_loss)
+            contact_losses.append(contact_loss)
+            torque_kwargs = {"limits": memory["limits"]} if self.is_pen else {}
+            tau = self.mdp.pd_torque(x, w["u"][:, j], simulator, **torque_kwargs)
             _, cage, _ = self.reward_step(
                 x1,
                 memory,
@@ -397,16 +527,16 @@ class DexSuperMimicRunner:
                 world_velocity / world_velocity.norm(dim=-1, keepdim=True).clamp_min(1e-8),
                 world_velocity,
             )
-            auxiliary = self.advance_disturbance(
-                auxiliary,
-                event,
-                world_direction,
-                world_velocity,
-            )
+            if self.is_pen:
+                auxiliary = w["aux"][:, min(j + 1, window - 1)]
+            else:
+                auxiliary = self.advance_disturbance(auxiliary, event, world_direction, world_velocity)
             x = x1 + w["push"][:, j]
         mask = w["mask"]
         denom = mask.sum().clamp_min(1)
         wm_loss = (torch.stack(losses, 1) * mask).sum() / mask.shape[0]
+        state_component = (torch.stack(state_losses, 1) * mask).sum() / denom
+        contact_component = (torch.stack(contact_losses, 1) * mask).sum() / denom
         if not holdout:
             self.optimize("wm", wm_loss)
         true = self.replay_failure_features(w, simulator)
@@ -430,6 +560,8 @@ class DexSuperMimicRunner:
             supervision_window=window,
             wm_loss=wm_loss.detach(),
             failure_loss=failure_loss.detach(),
+            state_loss=state_component.detach(),
+            contact_digit_loss=contact_component.detach(),
         )
 
     @torch.no_grad()
@@ -440,7 +572,7 @@ class DexSuperMimicRunner:
         x = w["x1"].flatten(0, 1)
         context = self.observations.context(
             x,
-            unflatten_memory(w["m"].flatten(0, 1)),
+            self.unflatten_memory(w["m"].flatten(0, 1)),
             w["aux"].flatten(0, 1),
             simulator[:, None].expand(-1, window, -1).reshape(batch * window, -1),
         )
@@ -449,6 +581,10 @@ class DexSuperMimicRunner:
     def load_model_only(self, path):
         """A/B starts actor, critic and optimizers fresh; source checkpoint is read-only."""
         state = torch.load(path, map_location=self.device, weights_only=False)
+        if checkpoint_task(state["config"]) != self.cfg.task:
+            raise ValueError("Model initialization task mismatch")
+        if getattr(self, "is_pen", False) and state.get("reference_signature") != self.mdp.reference_signature:
+            raise ValueError("Pen-spin reference data mismatch")
         if (
             state["format_version"] not in (2, 3)
             or state["joint_names"] != list(self.reader.robot.joint_names)
@@ -505,7 +641,7 @@ class DexSuperMimicRunner:
         c = self.cfg
         w = self.sample_starts()
         x = w["x"]
-        m = unflatten_memory(w["m"])
+        m = self.unflatten_memory(w["m"])
         history = self.history_from_obs(w["obs"])
         auxiliary = w["aux"]
         simulator = w["sim_context"]
@@ -535,7 +671,7 @@ class DexSuperMimicRunner:
                 context = self.task_features(x, m, auxiliary, simulator)
                 xs.append(self.critic_features(context))
                 a = self.step_actor(self.mdp.flatten_history(history))
-                target, u = ema_target(
+                target, u = self.mdp.control_target(a, m, bias) if self.is_pen else ema_target(
                     a,
                     m["c1"],
                     self.mdp.default,
@@ -547,13 +683,21 @@ class DexSuperMimicRunner:
                     self.mdp.dt,
                 )
                 x1, contact = self.step_wm(
-                    x, u, self.wm_features(x, simulator, auxiliary[:, 12:21])
+                    x, u, self.wm_features(x, simulator, self.observations.disturbance(auxiliary))
                 )
-                tau = self.mdp.pd_torque(x, u, simulator)
+                torque_kwargs = {"limits": m["limits"]} if self.is_pen else {}
+                tau = self.mdp.pd_torque(x, u, simulator, **torque_kwargs)
                 r, cage, _ = self.reward_step(x1, m, a, target, contact.sigmoid(), tau, soft=True)
                 # Original termination reads the PRE-reward counter.
-                analytic = torch.sigmoid((m["cage"].squeeze(-1) - self.mdp.max_outside + 0.5) / 0.25)
-                d = analytic
+                if self.is_pen:
+                    d = self.mdp.termination(x1, m)
+                else:
+                    d = torch.sigmoid((m["cage"].squeeze(-1) - self.mdp.max_outside + 0.5) / 0.25)
+                if self.is_pen:
+                    # A finite demonstration ends the imagined return; it is
+                    # excluded from the physical-failure head's labels.
+                    reference_end = (m["time"] + 1 >= m["end"] - m["start"]).squeeze(-1)
+                    d = torch.where(reference_end, 1.0, d)
                 next_goal = quat_to_mat(F.normalize(torch.randn(x.shape[0], 4, device=x.device), dim=-1))
                 next_memory = self.advance_memory(
                     x1,
@@ -583,16 +727,20 @@ class DexSuperMimicRunner:
                 active = event & (
                     updated["age"] * self.mdp.dt >= 3
                 )
-                push[..., -6:-3] = dv * active
+                push[..., -6:-3] = 0 if self.is_pen else dv * active
                 # The task caches the most recent sampled world-frame disturbance.
                 # A sampled event before warmup clears the cache as in the simulator.
                 palm_rotation = auxiliary[:, 3:12].reshape(-1, 3, 3)
                 world_dv = mv(palm_rotation, dv * active)
                 world_dir = mv(palm_rotation, F.normalize(dv, dim=-1) * active)
-                auxiliary = self.advance_disturbance(auxiliary, event, world_dir, world_dv)
+                if not self.is_pen:
+                    auxiliary = self.advance_disturbance(auxiliary, event, world_dir, world_dv)
                 x = x1 + push
                 m = updated
-                observation = self.mdp.noisy_observation(self.mdp.observation(x, m))
+                observation = (
+                    self.mdp.policy_observation(x, m, auxiliary) if self.is_pen
+                    else self.mdp.noisy_observation(self.mdp.observation(x, m))
+                )
                 history = torch.cat((history[:, 1:], observation[:, None]), 1)
             context = self.task_features(x, m, auxiliary, simulator)
             final = self.critic_features(context)
@@ -688,10 +836,9 @@ class DexSuperMimicRunner:
                     wall_seconds=self.wall_offset + time.perf_counter() - start,
                     sim_steps=self.sim_steps,
                 )
-                scalar = {k: float(v) for k, v in stats.items()}
                 if self.cfg.profile:
                     elapsed = max(sum(phase_times.values()), 1e-12)
-                    scalar.update(
+                    stats.update(
                         {
                             **{f"profile/seconds/{k}": v for k, v in phase_times.items()},
                             **{f"profile/calls/{k}": v for k, v in phase_counts.items()},
@@ -701,6 +848,7 @@ class DexSuperMimicRunner:
                             },
                         }
                     )
+                scalar = organize_log_scalars(stats, it)
                 self.writer.log_scalars(scalar, it)
                 print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
             if (it + 1) % self.cfg.save_interval == 0:
@@ -711,6 +859,7 @@ class DexSuperMimicRunner:
     def save(self, path, next_iteration=None):
         state = dict(
             format_version=3,
+            reference_signature=getattr(self.mdp, "reference_signature", None),
             torque_norm=self.torque_norm.state_dict(),
             config=self.cfg.to_dict(),
             iteration=self.iteration if next_iteration is None else next_iteration,
@@ -747,6 +896,10 @@ class DexSuperMimicRunner:
 
     def load(self, path):
         state = torch.load(path, map_location=self.device, weights_only=False)
+        if checkpoint_task(state["config"]) != self.cfg.task:
+            raise ValueError("Checkpoint task mismatch")
+        if getattr(self, "is_pen", False) and state.get("reference_signature") != self.mdp.reference_signature:
+            raise ValueError("Pen-spin reference data mismatch")
         if "utd" not in state["config"] or "critic_minibatches" not in state["config"]:
             raise ValueError(
                 "Checkpoint predates the SuperMimic training recipe. Start a fresh run, "

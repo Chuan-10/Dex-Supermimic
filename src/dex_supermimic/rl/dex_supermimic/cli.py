@@ -21,7 +21,7 @@ def train_config(cfg, folder=None):
         raise RuntimeError("Training requires an NVIDIA CUDA GPU.")
     import warp as wp
     from mjlab.envs import ManagerBasedRlEnv
-    from dex_supermimic.tasks.dex_reorient.config.wuji_hand2.task import make_env_cfg
+    from dex_supermimic.tasks.dex_reorient.config.task import make_env_cfg
     from .runner import DexSuperMimicRunner
 
     random.seed(cfg.seed)
@@ -29,11 +29,14 @@ def train_config(cfg, folder=None):
     torch.manual_seed(cfg.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     wp.set_device(cfg.device)
-    env_cfg = make_env_cfg(cfg.num_envs, cfg.control_hz)
+    env_cfg = make_env_cfg(cfg.num_envs, cfg.control_hz, task=cfg.task, recipe_path=cfg.recipe_path, clips_root=cfg.clips_root)
     env_cfg.seed = cfg.seed
     env_cfg.auto_reset = False
     env = ManagerBasedRlEnv(env_cfg, device=cfg.device)
-    folder = Path(folder) if folder else Path(cfg.log_dir) / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_root = Path(cfg.log_dir)
+    if cfg.task != "hand2-reorient":
+        log_root /= cfg.task
+    folder = Path(folder) if folder else log_root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     runner = None
     try:
         runner = DexSuperMimicRunner(env, cfg, folder)
@@ -51,6 +54,8 @@ def train_config(cfg, folder=None):
 @dataclass
 class PlayConfig:
     checkpoint: str
+    recipe_path: str | None = None
+    clips_root: str | None = None
     num_envs: int = 1
     device: str = "cuda:0"
     steps: int = 0
@@ -78,12 +83,14 @@ def play():
 
         os.environ.setdefault("MUJOCO_GL", "egl")
     from mjlab.envs import ManagerBasedRlEnv
-    from dex_supermimic.tasks.dex_reorient.config.wuji_hand2.task import make_env_cfg
+    from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task, make_env_cfg
     from .networks import Actor
 
     checkpoint = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=False)
+    task = checkpoint_task(checkpoint["config"])
     if checkpoint.get("format_version") not in (1, 2, 3):
         raise ValueError("Unsupported checkpoint format")
+    is_pen = task == "hand2-pen-spin"
     state = checkpoint["modules"]["actor"]
     actor = Actor(state["norm.mean"].numel()).to(cfg.device)
     actor.load_state_dict(state)
@@ -104,10 +111,11 @@ def play():
         path.with_suffix(".json").write_text(
             json.dumps(
                 dict(
+                    task=task,
                     control_hz=checkpoint["config"]["control_hz"],
                     joint_names=checkpoint["joint_names"],
-                    history=3,
-                    terms=[
+                    history=1 if is_pen else 3,
+                    terms=["motion", "joint_pos", "joint_vel", "object_pose", "last_action"] if is_pen else [
                         "noisy_joint_angles",
                         "qpos_error",
                         "cube_pos_in_tag",
@@ -115,15 +123,19 @@ def play():
                         "action_history",
                     ],
                     action_scale=0.5,
-                    ema_alpha=0.3 if checkpoint["config"]["control_hz"] == 50 else 0.5,
-                    warmup_time_s=0.4,
+                    ema_alpha=0.5 if is_pen else (0.3 if checkpoint["config"]["control_hz"] == 50 else 0.5),
+                    warmup_time_s=0.0 if is_pen else 0.4,
+                    action_type="reference_plus_ema_residual" if is_pen else "absolute_ema",
+                    residual_clip=[-0.6, 0.6] if is_pen else None,
                 ),
                 indent=2,
             )
         )
         print(f"Exported {path} (normalization included; EMA remains in the environment/controller)")
-    env_cfg = make_env_cfg(cfg.num_envs, checkpoint["config"]["control_hz"], play=True)
-    if cfg.viser:
+    env_cfg = make_env_cfg(cfg.num_envs, checkpoint["config"]["control_hz"], play=True, task=task,
+        recipe_path=cfg.recipe_path or checkpoint["config"].get("recipe_path"),
+        clips_root=cfg.clips_root or checkpoint["config"].get("clips_root"))
+    if cfg.viser and not is_pen:
         from functools import partial
 
         object_cfg = env_cfg.scene.entities["object"]
@@ -137,11 +149,18 @@ def play():
     if cfg.viser:
         from .viser import DexViserPlayViewer
 
+        def make_reader(play_env):
+            from .pen import PenSimReader
+            from .sim import SimReader
+
+            return PenSimReader(play_env) if is_pen else SimReader(play_env)
+
         try:
             env.reset()
             viewer = DexViserPlayViewer(
                 env, policy=lambda obs: actor(obs["policy"]), checkpoint=checkpoint,
                 wm_horizon=cfg.wm_horizon, wm_opacity=cfg.wm_opacity,
+                make_reader=make_reader,
             )
             viewer.run(num_steps=cfg.steps or None)
         finally:
@@ -163,8 +182,12 @@ def play():
                 action = actor(obs["policy"])
             obs, reward, _, _, _ = env.step(action)
             reward_sum += float(reward.mean())
-            drop_sum += int(env.termination_manager.get_term("cage_drop").sum())
-            success_sum += int(env.command_manager.get_term("reorient_command").success_achieved.sum())
+            if is_pen:
+                drop_sum += int(env.termination_manager.terminated.sum())
+                success_sum += int(env.termination_manager.get_term("reference_end").sum())
+            else:
+                drop_sum += int(env.termination_manager.get_term("cage_drop").sum())
+                success_sum += int(env.command_manager.get_term("reorient_command").success_achieved.sum())
             if viewer is not None:
                 if not viewer.is_running():
                     break

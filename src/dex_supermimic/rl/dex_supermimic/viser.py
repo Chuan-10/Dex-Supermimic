@@ -11,13 +11,10 @@ import torch
 from mjlab.viewer import ViserPlayViewer
 
 from .networks import WorldModel
-from .observations import TaskObservations
-from .sim import SimReader
 from .state import STATE_DIM, unpack
 from .rotations import mat_to_quat, mm, mv
 
 PREDICTION_COLOR = (150, 210, 255)
-
 
 def install_box_groups(scene):
     """Keep box labels that mjlab 1.6 otherwise discards when batching.
@@ -67,26 +64,44 @@ def install_box_groups(scene):
     scene.clear = MethodType(clear, scene)
     scene._sync_boxes = MethodType(sync_boxes, scene)
 
-
 class WorldModelTracker:
     """Action-conditioned open-loop predictions, with per-environment resets."""
 
-    def __init__(self, env, checkpoint, horizon=8):
+    def __init__(self, env, checkpoint, horizon=8, make_reader=None):
         self.env, self.horizon = env, horizon
-        self.reader = SimReader(env)
+        self.reader = make_reader(env) if make_reader is not None else None
+        if self.reader is None:
+            from .sim import SimReader
+
+            self.reader = SimReader(env)
         if list(checkpoint["joint_names"]) != list(self.reader.robot.joint_names):
             raise ValueError("WM checkpoint/environment joint order mismatch")
         if list(map(tuple, checkpoint["context_names"])) != self.reader.context_names:
             raise ValueError("WM checkpoint/environment simulator context mismatch")
         state = checkpoint["modules"]["wm"]
         width = state["norm.mean"].numel()
-        if width != STATE_DIM + self.reader.xi.shape[-1] + 9 + 20:
-            raise ValueError("Unsupported checkpoint WM input layout")
+        # Task dynamics are x + simulator context + disturbance; the cube reader
+        # was written before that common layout was factored into PenObservations.
+        if hasattr(self.reader, "auxiliary_observations"):
+            self.observations = self.reader.auxiliary_observations()
+            disturbance_width = self.observations.disturbance(
+                self.observations.auxiliary()
+            ).shape[-1]
+        else:
+            from .observations import TaskObservations
+
+            self.observations = TaskObservations(self.reader)
+            disturbance_width = 9
+        dynamics_width = STATE_DIM + self.reader.xi.shape[-1] + disturbance_width
+        if width != dynamics_width + 20:
+            raise ValueError(
+                f"Unsupported checkpoint WM input layout: {width}, expected "
+                f"{dynamics_width + 20} ({dynamics_width} dynamics + 20 control)"
+            )
         self.wm = WorldModel(width - 20, checkpoint["contact_dim"],
                              tuple(checkpoint["config"]["wm_hidden"]), amp=False).to(env.device)
         self.wm.load_state_dict(state, strict=True)
         self.wm.eval().requires_grad_(False)
-        self.observations = TaskObservations(self.reader)
         self.prediction = self.reader.state()
         self.age = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self.reader.attach_capture()
@@ -96,12 +111,18 @@ class WorldModelTracker:
         self.reader.refresh_frame()
         self.prediction = torch.where((self.age == 0)[:, None], self.reader.state(), self.prediction)
         aux = self.observations.auxiliary()
-        self.dynamics = self.observations.dynamics(self.prediction, self.reader.xi, aux[:, 12:21])
+        self.dynamics = self.observations.dynamics(
+            self.prediction, self.reader.xi, self.observations.disturbance(aux)
+        )
 
     @torch.no_grad()
     def after_step(self):
-        target = self.env.action_manager.get_term("joint_pos").processed_action
-        control = target - self.reader.robot.data.encoder_bias
+        target = getattr(self.reader, "executed_target", lambda: None)()
+        if target is None:
+            target = self.env.action_manager.get_term("joint_pos").processed_action
+            control = target - self.reader.robot.data.encoder_bias
+        else:
+            control = target
         self.prediction, _ = self.wm(self.prediction, control, self.dynamics)
         if not torch.isfinite(self.prediction).all():
             raise RuntimeError("Nonfinite WM prediction; playback paused")
@@ -114,12 +135,17 @@ class WorldModelTracker:
         self.prediction[ids] = self.reader.state()[ids]
         self.age[ids] = 0
 
+    @property
+    def object_group(self):
+        """Viser folder label for the task object; defaults to the cube name."""
+        return getattr(self.reader, "world_model_object_group", "object")
+
     def close(self):
         self.reader.detach_capture()
 
 
 class WorldModelMeshes:
-    """Render selected environment under /world_model/{hand,object}."""
+    """Render selected environment under /world_model/{hand,<task object>}."""
 
     def __init__(self, server, tracker, opacity=0.4):
         from mjviser.conversions import group_geoms_by_visual_compat, merge_geoms
@@ -128,15 +154,16 @@ class WorldModelMeshes:
         reader, model = tracker.reader, tracker.env.sim.mj_model
         self.root = server.scene.add_frame("/world_model", show_axes=False)
         server.scene.add_frame("/world_model/hand", show_axes=False)
-        server.scene.add_frame("/world_model/object", show_axes=False)
+        object_group = tracker.object_group
+        server.scene.add_frame(f"/world_model/{object_group}", show_axes=False)
         bodies = []
         for local, bid in enumerate(reader.kin.body_ids):
             short = model.body(bid).name.rsplit("/", 1)[-1]
             if short == "right_palm_link" or short.startswith("right_finger"):
                 bodies.append((bid, "hand", short, local))
         for bid in reader.obj.indexing.body_ids.cpu().tolist():
-            bodies.append((bid, "object", model.body(bid).name.rsplit("/", 1)[-1], None))
-        mesh_counts = {"hand": 0, "object": 0}
+            bodies.append((bid, object_group, model.body(bid).name.rsplit("/", 1)[-1], None))
+        mesh_counts = {"hand": 0, object_group: 0}
         for bid, group, name, local in bodies:
             path = f"/world_model/{group}/{name}"
             self.frames[(group, local)] = server.scene.add_frame(path, show_axes=False)
@@ -150,9 +177,6 @@ class WorldModelMeshes:
                 mesh_counts[group] += 1
         if not all(mesh_counts.values()):
             raise ValueError(f"Missing WM hand/object render geometry: {mesh_counts}")
-        print(f"[WM] scene tree: world_model/hand ({mesh_counts['hand']} meshes), "
-              f"world_model/object ({mesh_counts['object']} meshes); "
-              f"light blue, opacity={opacity}, horizon={tracker.horizon}", flush=True)
 
     @torch.no_grad()
     def update(self, scene):
@@ -177,22 +201,23 @@ class WorldModelMeshes:
                 handle.position = object_p[idx].cpu().numpy()
                 handle.wxyz = mat_to_quat(object_r[idx]).cpu().numpy()
 
-
 class DexViserPlayViewer(ViserPlayViewer):
-    def __init__(self, env, policy, checkpoint, wm_horizon=8, wm_opacity=0.4, **kwargs):
+    def __init__(
+        self, env, policy, checkpoint, wm_horizon=8, wm_opacity=0.4,
+        make_reader=None, **kwargs,
+    ):
         super().__init__(env, policy, **kwargs)
         self.tracker = None
         self.wm_meshes = None
         self.wm_opacity = wm_opacity
         if checkpoint.get("format_version") == 3 and "wm" in checkpoint.get("modules", {}):
-            self.tracker = WorldModelTracker(env, checkpoint, wm_horizon)
+            self.tracker = WorldModelTracker(env, checkpoint, wm_horizon, make_reader=make_reader)
         else:
             print("[WM] This checkpoint has no compatible format-3 WM; playing actor only.", flush=True)
 
     def setup(self):
         super().setup()
         install_box_groups(self._scene)
-        print("[Viser] separate scene nodes: debug/env_<n>/cage and debug/env_<n>/target", flush=True)
         if self.tracker is not None:
             self.wm_meshes = WorldModelMeshes(self._server, self.tracker, self.wm_opacity)
 

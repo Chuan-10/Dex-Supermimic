@@ -84,7 +84,7 @@ def evaluate_goal_reversal(env, reader, actor, steps=32):
 def evaluate(checkpoint, seed, steps, num_envs=64, device="cuda:0"):
     """Original training task, DR and termination; no simplified play task."""
     from mjlab.envs import ManagerBasedRlEnv
-    from dex_supermimic.tasks.dex_reorient.config.wuji_hand2.task import make_env_cfg
+    from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task, make_env_cfg
     from .networks import Actor
     from .sim import SimReader
     from .state import unpack
@@ -94,7 +94,7 @@ def evaluate(checkpoint, seed, steps, num_envs=64, device="cuda:0"):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    cfg = make_env_cfg(num_envs, state["config"]["control_hz"], play=False)
+    cfg = make_env_cfg(num_envs, state["config"]["control_hz"], play=False, task=checkpoint_task(state["config"]))
     cfg.seed = seed
     cfg.auto_reset = False
     env = ManagerBasedRlEnv(cfg, device=device)

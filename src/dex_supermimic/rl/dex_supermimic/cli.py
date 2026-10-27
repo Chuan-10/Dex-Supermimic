@@ -84,7 +84,7 @@ def play():
         os.environ.setdefault("MUJOCO_GL", "egl")
     from mjlab.envs import ManagerBasedRlEnv
     from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task, make_env_cfg
-    from .networks import Actor
+    from .networks import Actor, EmpiricalNormActor
 
     checkpoint = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=False)
     task = checkpoint_task(checkpoint["config"])
@@ -92,7 +92,9 @@ def play():
         raise ValueError("Unsupported checkpoint format")
     is_pen = task == "hand2-pen-spin"
     state = checkpoint["modules"]["actor"]
-    actor = Actor(state["norm.mean"].numel()).to(cfg.device)
+    empirical_actor = "norm._mean" in state
+    obs_dim = state["norm._mean" if empirical_actor else "norm.mean"].numel()
+    actor = (EmpiricalNormActor(obs_dim) if empirical_actor else Actor(obs_dim)).to(cfg.device)
     actor.load_state_dict(state)
     actor.eval()
     if cfg.export_onnx:

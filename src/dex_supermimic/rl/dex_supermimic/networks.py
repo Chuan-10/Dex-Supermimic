@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from .common import RunningNorm, mlp
+from .common import EmpiricalNorm, RunningNorm, mlp
 from .state import DELTA_DIM, STATE_DIM, integrate
 
 
@@ -92,6 +92,14 @@ class Actor(nn.Module):
 
     def forward(self, obs):
         return torch.tanh(self.net(self.norm(obs)))
+
+
+class EmpiricalNormActor(Actor):
+    """Compatibility wrapper for PPO-branch checkpoints using EmpiricalNorm."""
+
+    def __init__(self, obs_dim=207):
+        super().__init__(obs_dim)
+        self.norm = EmpiricalNorm(obs_dim)
 
 
 class Critic(nn.Module):

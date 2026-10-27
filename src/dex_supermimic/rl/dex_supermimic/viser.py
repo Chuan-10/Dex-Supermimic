@@ -74,10 +74,23 @@ class WorldModelTracker:
             from .sim import SimReader
 
             self.reader = SimReader(env)
+        # Release compatibility: first-generation Hand 2 checkpoints predate the
+        # compact six-ratio simulator context. Their context_names metadata is
+        # authoritative, so use it to select the exact original layout.
+        checkpoint_context = list(map(tuple, checkpoint["context_names"]))
+        legacy_context = False
+        if checkpoint_context != self.reader.context_names:
+            if checkpoint_context and checkpoint_context[0][0] == "geom_friction":
+                self.reader.legacy_context()
+                legacy_context = True
+            if checkpoint_context != self.reader.context_names:
+                raise ValueError(
+                    "Unsupported checkpoint simulator context layout: "
+                    f"checkpoint={checkpoint_context}, environment={self.reader.context_names}"
+                )
+            print("[WM] Using legacy friction-vector simulator context for release checkpoint.", flush=True)
         if list(checkpoint["joint_names"]) != list(self.reader.robot.joint_names):
             raise ValueError("WM checkpoint/environment joint order mismatch")
-        if list(map(tuple, checkpoint["context_names"])) != self.reader.context_names:
-            raise ValueError("WM checkpoint/environment simulator context mismatch")
         state = checkpoint["modules"]["wm"]
         width = state["norm.mean"].numel()
         # Task dynamics are x + simulator context + disturbance; the cube reader
@@ -90,7 +103,7 @@ class WorldModelTracker:
         else:
             from .observations import TaskObservations
 
-            self.observations = TaskObservations(self.reader)
+            self.observations = TaskObservations(self.reader, legacy_context=legacy_context)
             disturbance_width = 9
         dynamics_width = STATE_DIM + self.reader.xi.shape[-1] + disturbance_width
         if width != dynamics_width + 20:

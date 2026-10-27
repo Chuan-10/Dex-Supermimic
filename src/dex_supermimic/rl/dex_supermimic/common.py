@@ -57,3 +57,31 @@ class RunningNorm(nn.Module):
 
     def std(self):
         return torch.sqrt(self.var + self.eps**2)
+
+
+class EmpiricalNorm(nn.Module):
+  """Exact rsl-rl empirical normalization used by the upstream Wuji PPO recipe."""
+
+  def __init__(self, dim: int, eps: float = 1e-2):
+    super().__init__()
+    self.eps = eps
+    self.register_buffer("_mean", torch.zeros(dim).unsqueeze(0))
+    self.register_buffer("_var", torch.ones(dim).unsqueeze(0))
+    self.register_buffer("_std", torch.ones(dim).unsqueeze(0))
+    self.register_buffer("count", torch.tensor(0, dtype=torch.long))
+
+  @torch.jit.unused
+  @torch.no_grad()
+  def update(self, x):
+    count_x = x.shape[0]
+    self.count += count_x
+    rate = count_x / self.count
+    var_x = x.var(0, unbiased=False, keepdim=True)
+    mean_x = x.mean(0, keepdim=True)
+    delta_mean = mean_x - self._mean
+    self._mean += rate * delta_mean
+    self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))
+    self._std = torch.sqrt(self._var)
+
+  def forward(self, x):
+    return (x - self._mean) / (self._std + self.eps)

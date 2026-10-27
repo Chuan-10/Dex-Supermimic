@@ -239,6 +239,10 @@ class PenSimReader(SimReader):
     def auxiliary_observations(self):
         return PenObservations(self)
 
+    def legacy_context(self):
+        """There are no legacy pen-spin release layouts; fail explicitly."""
+        raise ValueError("Legacy friction-vector context is only defined for cube reorientation")
+
     def context(self):
         """Read pen DR without adding a privileged term to the clean critic.
 

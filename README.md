@@ -78,6 +78,24 @@ Run from the repository root. The first launch may spend extra time compiling Wa
 uv run dex-supermimic-train --task hand1-reorient
 ```
 
+Hand 2 cube reorientation also has an on-simulator PPO baseline for comparison with
+the world-model objective:
+
+```bash
+uv run dex-supermimic-train --algorithm ppo --task hand2-reorient
+```
+
+PPO currently intentionally rejects the other tasks and the 20 Hz recipe: it is an
+exact port of upstream `WujiHand2_Reorient_50Hz`. This includes the upstream 50 Hz
+environment/observation configuration, critic histories, sensors, 100-step rollout
+horizon, `gamma=0.996`, state-dependent Gaussian actor (`init_std=0.5`, range
+`[0.2, 50]`), empirical actor/critic normalization, rsl-rl timeout reward
+bootstrapping, four epochs, 32 mini-batches, entropy coefficient 0.001, value
+coefficient 0.5, one fixed-1e-4 Adam optimizer, and conventional vectorized
+auto-reset. PPO checkpoints are written every 1,000 iterations and remain playable
+with `dex-supermimic-play`; world-model and PPO checkpoints are not
+interchangeable for resuming.
+
 Before training `hand2-pen-spin`, download its upstream motion catalog:
 
 ```bash

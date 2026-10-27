@@ -22,6 +22,7 @@ def train_config(cfg, folder=None):
     import warp as wp
     from mjlab.envs import ManagerBasedRlEnv
     from dex_supermimic.tasks.dex_reorient.config.task import make_env_cfg
+    from dex_supermimic.tasks.dex_reorient.config.recipe import configure_wuji_ppo
     from .runner import DexSuperMimicRunner
 
     random.seed(cfg.seed)
@@ -30,12 +31,13 @@ def train_config(cfg, folder=None):
     torch.backends.cuda.matmul.allow_tf32 = True
     wp.set_device(cfg.device)
     env_cfg = make_env_cfg(cfg.num_envs, cfg.control_hz, task=cfg.task, recipe_path=cfg.recipe_path, clips_root=cfg.clips_root)
+    if cfg.algorithm == "ppo":
+        configure_wuji_ppo(env_cfg, cfg.control_hz)
     env_cfg.seed = cfg.seed
     env_cfg.auto_reset = False
     env = ManagerBasedRlEnv(env_cfg, device=cfg.device)
     log_root = Path(cfg.log_dir)
-    if cfg.task != "hand2-reorient":
-        log_root /= cfg.task
+    log_root /= cfg.task
     folder = Path(folder) if folder else log_root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     runner = None
     try:
@@ -84,22 +86,28 @@ def play():
         os.environ.setdefault("MUJOCO_GL", "egl")
     from mjlab.envs import ManagerBasedRlEnv
     from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task, make_env_cfg
-    from .networks import Actor
+    from .networks import Actor, GaussianPPOActor
 
     checkpoint = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=False)
     task = checkpoint_task(checkpoint["config"])
-    if checkpoint.get("format_version") not in (1, 2, 3):
+    is_ppo = checkpoint.get("format_version") == 4
+    if checkpoint.get("format_version") not in (1, 2, 3, 4):
         raise ValueError("Unsupported checkpoint format")
     is_pen = task == "hand2-pen-spin"
     state = checkpoint["modules"]["actor"]
-    actor = Actor(state["norm.mean"].numel()).to(cfg.device)
+    if is_ppo:
+        actor = GaussianPPOActor(state["norm._mean"].shape[-1], state["net.6.bias"].numel() // 2)
+    else:
+        actor = Actor(state["norm.mean"].numel())
+    actor = actor.to(cfg.device)
     actor.load_state_dict(state)
     actor.eval()
+    policy_actor = actor.mean if is_ppo else actor
     if cfg.export_onnx:
         path = Path(cfg.export_onnx)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.onnx.export(
-            actor,
+            policy_actor,
             torch.zeros(1, state["norm.mean"].numel(), device=cfg.device),
             str(path),
             input_names=["policy"],
@@ -158,7 +166,7 @@ def play():
         try:
             env.reset()
             viewer = DexViserPlayViewer(
-                env, policy=lambda obs: actor(obs["policy"]), checkpoint=checkpoint,
+                env, policy=lambda obs: policy_actor(obs["policy"]), checkpoint=checkpoint,
                 wm_horizon=cfg.wm_horizon, wm_opacity=cfg.wm_opacity,
                 make_reader=make_reader,
             )
@@ -170,7 +178,7 @@ def play():
     if cfg.viewer:
         from mjlab.viewer import NativeMujocoViewer
 
-        viewer = NativeMujocoViewer(env, policy=lambda obs: actor(obs["policy"]))
+        viewer = NativeMujocoViewer(env, policy=lambda obs: policy_actor(obs["policy"]))
         viewer.setup()
     try:
         obs, _ = env.reset()
@@ -179,7 +187,7 @@ def play():
         success_sum = 0
         for _ in range(cfg.steps):
             with torch.no_grad():
-                action = actor(obs["policy"])
+                action = policy_actor(obs["policy"])
             obs, reward, _, _, _ = env.step(action)
             reward_sum += float(reward.mean())
             if is_pen:

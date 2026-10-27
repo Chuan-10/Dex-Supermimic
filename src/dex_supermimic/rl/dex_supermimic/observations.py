@@ -45,13 +45,22 @@ CURRENT_TERMS = {
 }
 BASE_DIM = sum(BASE_TERMS.values())
 CURRENT_DIM = sum(CURRENT_TERMS.values())
+LEGACY_CURRENT_TERMS = {**CURRENT_TERMS, "dr_params": 3}
+LEGACY_CURRENT_DIM = sum(LEGACY_CURRENT_TERMS.values())
 FRAME_DIM = BASE_DIM + CURRENT_DIM
+LEGACY_FRAME_DIM = BASE_DIM + LEGACY_CURRENT_DIM
 
 
 class TaskObservations:
-    def __init__(self, reader):
+    base_terms = BASE_TERMS
+
+    def __init__(self, reader, legacy_context=False):
         self.reader = reader
         self.mdp = reader.mdp
+        self.legacy_context = legacy_context
+        self.current_terms = LEGACY_CURRENT_TERMS if legacy_context else CURRENT_TERMS
+        self.dr_dim = 3 if legacy_context else DR_PARAM_DIM
+        self.frame_dim = LEGACY_FRAME_DIM if legacy_context else FRAME_DIM
         env = reader.env
         tip_cfg = env.observation_manager.get_term_cfg("critic", "fingertip_positions")
         self.tip_ids = tip_cfg.params["asset_cfg"].body_ids
@@ -59,7 +68,7 @@ class TaskObservations:
         self.tip_offset = torch.tensor(tip_cfg.params["offset"], device=env.device)
         self.default_velocity = reader.robot.data.default_joint_vel[0].clone()
         self.episode_steps = env.max_episode_length
-        self.context_dim = reader.xi.shape[-1] + FRAME_DIM
+        self.context_dim = reader.xi.shape[-1] + self.frame_dim
 
     @staticmethod
     def disturbance(auxiliary):
@@ -76,6 +85,10 @@ class TaskObservations:
         runtime = get_reorient_runtime_state(env)
         cfg = env.observation_manager.get_term_cfg("critic", "dr_params")
         dr = cfg.func(env, **cfg.params)
+        # Legacy release checkpoints selected only mass, damping, and object-size
+        # ratios here; the detailed friction vector was part of xi instead.
+        if self.legacy_context:
+            dr = dr[:, [1, 4, 5]]
         return torch.cat(
             (
                 reader.palm_pos - env.scene.env_origins,
@@ -90,7 +103,7 @@ class TaskObservations:
     def frame(self, x, memory, auxiliary):
         """Match the original critic's term frames, including frames and scaling."""
         position, rotation, direction, perturbation, dr = auxiliary.split(
-            (3, 9, 3, 6, DR_PARAM_DIM), -1
+            (3, 9, 3, 6, self.dr_dim), -1
         )
         rotation = rotation.reshape(-1, 3, 3)
         q, qd, _, _, v, w = unpack(x)
@@ -158,8 +171,6 @@ class TaskObservations:
             -1,
         )
 
-    @staticmethod
-    def critic(context):
-        # FailureHead context is [xi, task_frame]. Match the reference critic by
-        # moving its 165-dim task frame to the front and appending the 46-dim xi.
-        return torch.cat((context[..., -FRAME_DIM:], context[..., :-FRAME_DIM]), -1)
+    def critic(self, context):
+        """Move the trailing task frame ahead of simulator context."""
+        return torch.cat((context[..., -self.frame_dim :], context[..., : -self.frame_dim]), -1)

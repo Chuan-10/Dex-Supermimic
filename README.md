@@ -12,11 +12,9 @@ Dex SuperMimic combines a learned multi-step world model with actor-critic train
 
 ## Demos
 
-| Task | Visualization |
-|:---|:---:|
-| **Wuji Hand 1 · Cube Reorientation** | [![Wuji Hand 1 · Cube Reorientation](docs/demos/hand1_reorient.jpg)](docs/demos/hand1_reorient.jpg) |
-| **Wuji Hand 2 · Cube Reorientation** | [![Wuji Hand 2 · Cube Reorientation](docs/demos/hand2_reorient.jpg)](docs/demos/hand2_reorient.jpg) |
-| **Wuji Hand 2 · Pen Spin** | [![Wuji Hand 2 · Pen Spin](docs/demos/hand2_pen_spin.jpg)](docs/demos/hand2_pen_spin.jpg) |
+| Wuji Hand 1 · Cube Reorientation | Wuji Hand 2 · Cube Reorientation | Wuji Hand 2 · Pen Spin |
+| :---: | :---: | :---: |
+| <a href="docs/demos/hand1_reorient.jpg"><img src="docs/demos/hand1_reorient.jpg" alt="Wuji Hand 1 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_reorient.jpg"><img src="docs/demos/hand2_reorient.jpg" alt="Wuji Hand 2 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_pen_spin.jpg"><img src="docs/demos/hand2_pen_spin.jpg" alt="Wuji Hand 2 pen-spin demo" width="310"></a> |
 
 ## Contents
 
@@ -153,13 +151,13 @@ Pen spin requires `--control-hz 50`. Its clip downloader verifies clip hashes be
 
 | Option | Meaning |
 |---|---|
-| `--num-envs` | Number of parallel simulator environments. |
+| `--num-envs` | Number of parallel simulator environments. All tasks default to `1024`. |
 | `--device` | CUDA device, such as `cuda:0`. |
 | `--control-hz` | Simulator control rate: `20` or `50`; pen spin requires `50`. |
-| `--max-iterations` | Training iterations and final-checkpoint iteration. |
+| `--max-iterations` | Training iterations and final-checkpoint iteration. All tasks default to `8000`. |
 | `--checkpoint` | Resume a compatible full training state. |
 | `--model-checkpoint` | Initialize the world model only from another compatible run. |
-| `--logger` | `tensorboard` (default), `wandb`, or `none`. |
+| `--logger` | Metric backend: `tensorboard` (all-task default), `wandb`, or `none`. |
 | `--save-interval` | Iterations between intermediate `model_<it>.pt` checkpoints. |
 | `--no-compile` / `--no-compile-policy` | Disable simulator or imagination compilation to reduce startup time. |
 | `--profile` | Log cumulative collection, world-model, and policy wall time. |

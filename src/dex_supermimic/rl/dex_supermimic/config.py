@@ -25,8 +25,10 @@ class DexSuperMimicCfg:
     """Optional W&B mode passed as WANDB_MODE, e.g. offline or disabled."""
     device: str = "cuda:0"
     num_envs: int = 1024
+    """Number of parallel simulator environments; shared by every supported task."""
     control_hz: int = 50
     max_iterations: int = 8_000
+    """Total training iterations; shared by every supported task."""
     buffer_steps: int = 1000
     warmup_steps: int = 64
     utd: float = 0.4

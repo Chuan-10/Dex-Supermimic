@@ -13,6 +13,9 @@ from mjlab.viewer.model_sync import VIEWER_MODEL_FIELDS, sync_model_fields
 from .commands import wrist_local_points_to_world
 
 
+REFERENCE_GREEN = (0.10, 0.85, 0.30)
+
+
 def _numpy_ids(value: torch.Tensor) -> np.ndarray:
   return value.detach().cpu().numpy().astype(np.int64)
 
@@ -108,7 +111,7 @@ def _ghost_models(command, env_idx):
       "robot",
       env_idx,
       alpha=command.cfg.viz.hand_alpha,
-      color=command.cfg.viz.hand_color,
+      color=REFERENCE_GREEN,
     )
   if not hasattr(command, "_visualization_object_models"):
     command._visualization_object_models = _build_ghost_model(
@@ -116,7 +119,7 @@ def _ghost_models(command, env_idx):
       "object",
       env_idx,
       alpha=command.cfg.viz.object_alpha,
-      color=None,
+      color=REFERENCE_GREEN,
     )
   return command._visualization_robot_ghost, command._visualization_object_models
 

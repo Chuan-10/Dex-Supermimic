@@ -1,10 +1,59 @@
 # Dex SuperMimic
 
-![Dex SuperMimic teaser](teaser.jpg)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.7%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-555?logo=linux&logoColor=white)](#requirements)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://docs.astral.sh/uv/)
 
-This repository reproduces [SuperMimic](https://supermimic.github.io/) on dexterous hands, adapting its world-model-based training approach to in-hand cube reorientation with Wuji Hand 1 and Wuji Hand 2, and reference-based pen spinning with Wuji Hand 2. It is built on mjlab and MuJoCo Warp.
+> A world-model adaptation of [SuperMimic](https://supermimic.github.io/) for Wuji dexterous hands: train and visualize in-hand cube reorientation and reference-tracking pen spinning with the same imagination-based policy pipeline.
 
-## Download and Installation
+Dex SuperMimic combines a learned multi-step world model with actor-critic training in imagination. It uses [mjlab](https://github.com/mujocolab/mjlab) and [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp) for massively parallel GPU simulation, and packages the right Wuji Hand 1 / Hand 2 assets so installation does not require a Git submodule checkout.
+
+## Demos
+
+| Task | Visualization |
+|:---|:---:|
+| **Wuji Hand 1 · Cube Reorientation** | [![Wuji Hand 1 · Cube Reorientation](docs/demos/hand1_reorient.jpg)](docs/demos/hand1_reorient.jpg) |
+| **Wuji Hand 2 · Cube Reorientation** | [![Wuji Hand 2 · Cube Reorientation](docs/demos/hand2_reorient.jpg)](docs/demos/hand2_reorient.jpg) |
+| **Wuji Hand 2 · Pen Spin** | [![Wuji Hand 2 · Pen Spin](docs/demos/hand2_pen_spin.jpg)](docs/demos/hand2_pen_spin.jpg) |
+
+## Contents
+
+- [Overview](#overview)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Tasks](#tasks)
+- [Training](#training)
+- [Playing and Evaluation](#playing-and-evaluation)
+- [Pretrained Checkpoint](#pretrained-checkpoint)
+- [Project Structure](#project-structure)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+## Overview
+
+The project retains SuperMimic's three-phase idea:
+
+1. collect short real-simulator rollouts into a replay buffer;
+2. train a recurrent-style, multi-step world model on mixed normal and failure transitions;
+3. optimize the policy and critic along imagined rollouts, periodically refreshing the buffer from the real simulator.
+
+The implementation is task-aware: cube reorientation uses command/goal observations, an absolute EMA controller, contact and cage rewards, and a translucent world-model ghost in Viser. Pen spin tracks a packaged motion reference, uses a reference-plus-residual controller, and exposes the standard viewer without the cube-specific ghost overlay.
+
+The Wuji hands, cube, and ArUCo-tagged pen are bundled under permissive licenses. The third-party Wuji MJLab checkout in `thirdparty/` is retained as a porting reference and is not installed by `uv sync`.
+
+## Requirements
+
+- Linux x86_64 with an NVIDIA GPU is required for training and playback. CUDA 12.8 is tested; Blackwell/RTX 50-series GPUs are supported by MuJoCo Warp.
+- macOS arm64 can install and import the package, but training intentionally rejects non-CUDA devices.
+- Python 3.10–3.13 is selected automatically by `uv`.
+- At least one CUDA-capable GPU with enough memory for the requested parallel environment count. `--num-envs 1024` is the default starting point.
+- Disk space for the virtual environment, Wuji meshes, pen-spin motion catalog, checkpoints, and TensorBoard events.
+
+## Installation
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if it is not already available:
 
@@ -21,100 +70,187 @@ cd Dex-Supermimic
 uv sync
 ```
 
-`uv` creates the local Python environment and installs the project dependencies, including the bundled Wuji hand models and meshes. Cube reorientation needs no separate dataset. Pen spinning uses the motion download described below.
+`uv sync` creates `.venv/`, resolves the locked training environment, installs the `dex-supermimic-train` and `dex-supermimic-play` entry points, and installs the local `wuji-description` asset package. No dataset download is needed for cube reorientation. Pen-spin setup is described in [Tasks](#tasks).
+
+For a quick import and CLI check:
+
+```bash
+uv run python -c "import dex_supermimic, mjlab, mujoco, warp; print('imports ok')"
+uv run dex-supermimic-train --help
+```
+
+## Tasks
+
+| Task | Hand | Control rate | Data | Log directory |
+|---|---|---:|---|---|
+| `hand1-reorient` | Wuji Hand 1 (right) | 20 or 50 Hz | Bundled cube; no external dataset | `logs/dex_supermimic/hand1-reorient/<timestamp>` |
+| `hand2-reorient` | Wuji Hand 2 (right) | 20 or 50 Hz | Bundled cube; no external dataset | `logs/dex_supermimic/<timestamp>` |
+| `hand2-pen-spin` | Wuji Hand 2 (right) | 50 Hz only | Downloaded motion clips plus packaged recipe | `logs/dex_supermimic/hand2-pen-spin/<timestamp>` |
+
+Checkpoints record the task, control rate, joint order, observation layout, and reference fingerprint. Playback chooses the environment automatically. Checkpoints cannot be resumed or used as world-model initialization across different hands or incompatible task layouts.
+
+### Cube reorientation
+
+Wuji Hand 1 and Wuji Hand 2 rotate a goal-labeled cube in-hand. Both tasks use the same SuperMimic runner. Hand 1 retains its upstream soft thumb pad, initial grasp, wrist tag frame, contact sensors, and palm-cage axis. Hand 2 is the default task.
+
+### Pen spinning
+
+Pen spin performs reference-based, multi-axis pen tracking with Wuji Hand 2. The five packaged recipes are:
+
+```text
+src/dex_supermimic/tasks/pen_spin/data/recipe/
+├── 01_single_axis.json
+├── 02_continuous_single_axis.json
+├── 03_continuous_multi_axis.json        # default
+├── 04_stable_grasp_rotation.json
+└── 05_multi_axis_two_rotations.json
+```
+
+Detailed observation, controller, reward, and validation notes are available in:
+
+- [Hand 1 cube reorientation](src/dex_supermimic/rl/dex_supermimic/setting_hand1_reorient.md)
+- [Hand 2 cube reorientation](src/dex_supermimic/rl/dex_supermimic/setting_hand2_reorient.md)
+- [Hand 2 pen spin](src/dex_supermimic/rl/dex_supermimic/setting_hand2_pen_spin.md)
 
 ## Training
 
-Run from the repository root:
+Run from the repository root. The first launch may spend extra time compiling Warp and imagination kernels.
 
-```bash
-uv run dex-supermimic-train --num-envs 1024 --device cuda:0
-```
-
-This launches 1024 parallel environments on the first CUDA GPU. Training logs and checkpoints are saved to `logs/dex_supermimic/<timestamp>/`.
-
-Wuji Hand 1 cube reorientation uses the same SuperMimic world-model and
-imagination training pipeline, with the original Hand 1 model, soft thumb pad,
-initial grasp, wrist-tag frame, contact sensors, and palm cage axis:
+**Wuji Hand 1 cube reorientation**
 
 ```bash
 uv run dex-supermimic-train --task hand1-reorient --num-envs 1024 --device cuda:0
 ```
 
-Hand 1 runs are saved to `logs/dex_supermimic/hand1-reorient/<timestamp>/`.
-Both hands support `--control-hz 20` and `--control-hz 50` (default).
-Playback and evaluation select the hand from the checkpoint automatically:
+**Wuji Hand 2 cube reorientation (default task)**
 
 ```bash
-uv run dex-supermimic-play --checkpoint logs/dex_supermimic/hand1-reorient/<timestamp>/model_final.pt
+uv run dex-supermimic-train --task hand2-reorient --num-envs 1024 --device cuda:0
 ```
 
-The default task remains `hand2-reorient`; older checkpoints without a task
-field are read as Hand 2. Checkpoints cannot be resumed or used for world-model
-initialization across different hands. Hand 1 assets are bundled by `uv sync`;
-the `thirdparty/wuji-mjlab` checkout is only a porting reference.
+For cube reorientation, add `--control-hz 20` or `--control-hz 50` to choose the control rate (50 Hz is the default).
 
-Run the task-selection and packaged-model checks, plus CUDA simulator checks
-for both hands at both frequencies, with:
+**Wuji Hand 2 pen spinning**
 
-```bash
-uv run python -m unittest discover -s tests/dex_supermimic -v
-```
-
-CUDA checks cover observation reconstruction, differentiable fingertip
-kinematics, cage faces, and rewards independent of stale body kinematics.
-MuJoCo Warp simulator checks are skipped when CUDA is unavailable.
-Hand 1 has passed a small training/resume/playback smoke run; a converged
-Hand 1 policy and success-rate reproduction have not yet been validated.
-
-Training logs locally with TensorBoard by default. To use Weights & Biases, append `--logger wandb`; to disable logging, append `--logger none`.
-
-## Pen spinning (Hand 2)
-
-Download the upstream motion catalog, then train with the same SuperMimic runner:
+Download the upstream motion catalog, then train:
 
 ```bash
 uv run python -m dex_supermimic.tasks.pen_spin.tooling.download
 uv run dex-supermimic-train --task hand2-pen-spin --num-envs 1024 --device cuda:0
 ```
 
-The default recipe is continuous multi-axis rotation. Select another of the five
-packaged recipes with `--recipe-path src/dex_supermimic/tasks/pen_spin/data/recipe/01_single_axis.json`.
-Use `--clips-root /path/to/clips` for an external catalog. Pen spin requires 50 Hz.
-Logs are saved under `logs/dex_supermimic/hand2-pen-spin/<timestamp>/`.
-Playback selects the task and recipe from its checkpoint:
+Select a different recipe or an external clip catalog with:
 
 ```bash
-uv run dex-supermimic-play --checkpoint logs/dex_supermimic/hand2-pen-spin/<timestamp>/model_final.pt
+uv run dex-supermimic-train --task hand2-pen-spin \
+  --recipe-path src/dex_supermimic/tasks/pen_spin/data/recipe/01_single_axis.json \
+  --clips-root /path/to/clips
 ```
 
-Pen spin supports the standard Viser viewer, native viewer and headless playback;
-the cube-specific world-model ghost overlay is not used. The implementation has
-passed a small GPU training/resume smoke test; convergence has not been validated.
-See [the pen-spin recipe notes](src/dex_supermimic/rl/dex_supermimic/setting_hand2_pen_spin.md)
-for observation/controller details, validation and imagination approximations.
+Pen spin requires `--control-hz 50`. Its clip downloader verifies clip hashes before reporting success.
 
-## Visualization
+### Useful training options
 
-Download [`model_8000.pt`](https://github.com/CumulusAlpha/Dex-Supermimic/releases/download/pretrained-wuji-v1/model_8000.pt) from the [pretrained checkpoint release](https://github.com/CumulusAlpha/Dex-Supermimic/releases/tag/pretrained-wuji-v1) and place it at `logs/dex_supermimic/pretrained/model_8000.pt`. From the repository root:
+| Option | Meaning |
+|---|---|
+| `--num-envs` | Number of parallel simulator environments. |
+| `--device` | CUDA device, such as `cuda:0`. |
+| `--control-hz` | Simulator control rate: `20` or `50`; pen spin requires `50`. |
+| `--max-iterations` | Training iterations and final-checkpoint iteration. |
+| `--checkpoint` | Resume a compatible full training state. |
+| `--model-checkpoint` | Initialize the world model only from another compatible run. |
+| `--logger` | `tensorboard` (default), `wandb`, or `none`. |
+| `--save-interval` | Iterations between intermediate `model_<it>.pt` checkpoints. |
+| `--no-compile` / `--no-compile-policy` | Disable simulator or imagination compilation to reduce startup time. |
+| `--profile` | Log cumulative collection, world-model, and policy wall time. |
+
+Run `uv run dex-supermimic-train --help` for the full list.
+
+## Playing and Evaluation
+
+Viser playback uses one environment and runs until interrupted. Open the URL printed in the terminal.
+
+```bash
+uv run dex-supermimic-play \
+  --checkpoint logs/dex_supermimic/hand1-reorient/<timestamp>/model_final.pt
+```
+
+Useful options:
+
+```bash
+# Limit playback to 2,000 control steps
+uv run dex-supermimic-play --checkpoint <checkpoint.pt> --steps 2000
+
+# Native MuJoCo-style viewer
+uv run dex-supermimic-play --checkpoint <checkpoint.pt> --no-viser --viewer --steps 2000
+
+# Change world-model reseeding interval and ghost opacity in Viser
+uv run dex-supermimic-play --checkpoint <checkpoint.pt> --wm-horizon 32 --wm-opacity 0.5
+
+# Export an ONNX policy and matching deployment metadata
+uv run dex-supermimic-play --checkpoint <checkpoint.pt> --export-onnx exports/policy.onnx
+```
+
+For cube reorientation, the light-blue hand/object meshes show the world-model prediction. The real and predicted scene-tree branches can be toggled independently in Viser. Pen spin uses the standard viewer; the cube-specific ghost overlay is omitted.
+
+Inspect TensorBoard curves with:
+
+```bash
+uv run tensorboard --logdir logs/dex_supermimic
+```
+
+## Pretrained Checkpoint
+
+A Hand 1 cube-reorientation checkpoint is distributed separately as a GitHub Release attachment:
 
 ```bash
 mkdir -p logs/dex_supermimic/pretrained
 curl -fL --retry 3 \
   https://github.com/CumulusAlpha/Dex-Supermimic/releases/download/pretrained-wuji-v1/model_8000.pt \
   -o logs/dex_supermimic/pretrained/model_8000.pt
+
+uv run dex-supermimic-play \
+  --checkpoint logs/dex_supermimic/pretrained/model_8000.pt
 ```
 
-The pretrained checkpoint is distributed as a Release attachment and is downloaded separately from the source code. The `logs/` directory is ignored by Git.
+The `logs/` directory is Git-ignored, so the checkpoint remains separate from the source checkout. A converged Hand 1 policy and success-rate reproduction have not yet been fully validated; a small training/resume/playback smoke run has passed.
 
-From the repository root, load the pretrained checkpoint in the Viser web viewer:
+## Project Structure
+
+```text
+.
+├── packages/wuji-description/       # Pinned Wuji Hand 1/2 MJCF and meshes
+├── src/dex_supermimic/
+│   ├── assets/                      # Cube, pen, and resource loading
+│   ├── rl/dex_supermimic/           # SuperMimic runner, world model, replay buffer,
+│   │                                # policy/critic training, Viser playback
+│   └── tasks/
+│       ├── dex_reorient/            # Cube task, rewards, observations, events
+│       └── pen_spin/                # Pen task, recipes, motion-clip tooling
+├── logs/                            # Git-ignored TensorBoard and checkpoints
+├── thirdparty/wuji-mjlab/           # Optional local porting reference; not installed
+├── pyproject.toml                   # Package metadata, dependencies, and CLI entry points
+└── uv.lock                          # Locked Python environment
+```
+
+## Testing
+
+The task-selection, packaged-model, and CUDA simulator checks are packaged with the source tree:
 
 ```bash
-uv run dex-supermimic-play \
-  --checkpoint /home/motphys/supermimic-instinct/logs/dex_supermimic/hand1-reorient/2026-10-26_21-33-46/model_final.pt
+uv run python -m unittest discover -s tests/dex_supermimic -v
 ```
 
-Playback uses Viser and one environment by default and runs until you press `Ctrl+C` (`--steps 0` is the default). Open the viewer URL printed in the terminal in your browser. To limit playback, pass a positive control-step count such as `--steps 2000`. Replace the checkpoint path to view your own trained policy.
+MuJoCo Warp CUDA checks are skipped automatically when CUDA is unavailable. They cover observation reconstruction, differentiable fingertip kinematics, cage faces, and rewards independent of stale body kinematics. Pen spin has passed a small GPU training/resume smoke test; convergence has not yet been validated.
+
+## Troubleshooting
+
+- **Training says a CUDA GPU is required.** Training and playback intentionally require `cuda:*`. Use a CUDA machine and pass `--device cuda:0` or another valid CUDA device.
+- **First startup is slow.** Warp and imagination compilation can take considerable time. For iterative debugging, try `--no-compile-policy` or `--no-compile`; retain compilation for final performance runs.
+- **Out of GPU memory.** Reduce `--num-envs`, `--wm-batch`, or `--pi-batch`. Intermediate checkpoints let you continue from the last compatible state with `--checkpoint`.
+- **Checkpoint mismatch.** Full resume and world-model-only initialization require matching task, hand, control rate, joint order, and observation/reference layouts.
+- **Pen-spin rate error.** Pen spin requires 50 Hz reference playback. Do not pass `--control-hz 20` for `hand2-pen-spin`.
+- **Headless Viser rendering.** Playback sets `MUJOCO_GL=egl` by default when Viser is enabled. If EGL is unavailable, install/configure an appropriate EGL driver or run on a machine with working GPU rendering.
 
 ## Acknowledgments
 
@@ -123,5 +259,9 @@ We thank the [SuperMimic](https://supermimic.github.io/) authors for the origina
 We thank the authors and contributors of the following repositories:
 
 1. [InstinctMJ](https://github.com/project-instinct/InstinctMJ) — the foundation of this repository and its mjlab-based simulation framework.
-2. [Wuji MJLab](https://github.com/wuji-technology/wuji-mjlab) — the Wuji hand cube reorientation task and environment implementation.
+2. [Wuji MJLab](https://github.com/wuji-technology/wuji-mjlab) — the Wuji hand cube-reorientation and pen-spin task implementations.
 3. [supermimic_vibed](https://github.com/zita-ch/supermimic_vibed) — the SuperMimic reproduction.
+
+## License
+
+The task adaptations are released under the Apache License, Version 2.0. See [LICENSE](src/dex_supermimic/tasks/dex_reorient/LICENSE), [NOTICE](src/dex_supermimic/tasks/dex_reorient/NOTICE), and the corresponding files under [pen spin](src/dex_supermimic/tasks/pen_spin/NOTICE) for third-party attribution. The bundled Wuji descriptions retain their upstream MIT license in [`packages/wuji-description/LICENSE`](packages/wuji-description/LICENSE).

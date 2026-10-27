@@ -167,9 +167,23 @@ class SimReader:
         dr_cfg = self.env.observation_manager.get_term_cfg("critic", "dr_params")
         return self._context_from_dr_params(dr_cfg.func(self.env, **dr_cfg.params))
 
+    def legacy_context(self):
+        """Read the original friction-vector context used by first-release WMs."""
+        name = "geom_friction"
+        n = self.env.num_envs
+        ids = self.collision_geom_ids()
+        value = getattr(self.env.sim.model, name)
+        default = self.env.sim.get_default_field(name)
+        if value.ndim == default.ndim + 1:
+            value = value[:, ids].expand(n, *value[:, ids].shape[1:])
+        else:
+            value = value[ids].unsqueeze(0).expand(n, *value[ids].shape)
+        self.context_names = [(name, value.reshape(n, -1).shape[-1])]
+        self._append_actuator_context(values=[value.reshape(n, -1).clone()])
+        return self.xi
+
     def _context_from_dr_params(self, dr_params):
         """Concatenate a six-value DR summary with exact actuator gain ratios."""
-        model = self.env.sim.model
         N = self.env.num_envs
         values = []
         self.context_names = []
@@ -186,7 +200,15 @@ class SimReader:
             values.append(value.reshape(N, 1))
             self.context_names.append((name, 1))
 
-        # Exact per-joint gains remain at the end for analytic torque reconstruction.
+        return self._append_actuator_context(values=values)
+
+    def _append_actuator_context(self, values):
+        """Append exact per-joint Kp/Kd ratios to ``values`` and return ``xi``."""
+        model = self.env.sim.model
+        N = self.env.num_envs
+
+        # Keep the exact per-joint gains at the end for analytic torque
+        # reconstruction; startup DR context always precedes them.
         actuator_ids = self.robot.indexing.ctrl_ids.long()
         default_gainprm = self.env.sim.get_default_field("actuator_gainprm")
         default_biasprm = self.env.sim.get_default_field("actuator_biasprm")
@@ -215,7 +237,8 @@ class SimReader:
         self.context_names.append(("actuator_kp_ratios", kp_ratio.shape[-1]))
         values.append(kd_ratio)
         self.context_names.append(("actuator_kd_ratios", kd_ratio.shape[-1]))
-        return torch.cat(values, -1)
+        self.xi = torch.cat(values, -1)
+        return self.xi
 
     def attach_capture(self):
         """Capture postphysics state and reward-phase labels without extra forward passes.

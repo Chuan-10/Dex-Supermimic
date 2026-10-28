@@ -13,7 +13,7 @@ The bundled assets cover Wuji Hand 1 and Hand 2 tasks, so installation does not 
 
 | Wuji Hand 1 · Cube Reorientation | Wuji Hand 2 · Cube Reorientation | Wuji Hand 2 · Pen Spin |
 | :---: | :---: | :---: |
-| <a href="docs/demos/hand1_reorient.jpg"><img src="docs/demos/hand1_reorient.jpg" alt="Wuji Hand 1 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_reorient.jpg"><img src="docs/demos/hand2_reorient.jpg" alt="Wuji Hand 2 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_pen_spin.jpg"><img src="docs/demos/hand2_pen_spin.jpg" alt="Wuji Hand 2 pen-spin demo" width="310"></a> |
+| <a href="docs/demos/hand1_reorient.gif"><img src="docs/demos/hand1_reorient.gif" alt="Wuji Hand 1 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_reorient.gif"><img src="docs/demos/hand2_reorient.gif" alt="Wuji Hand 2 cube reorientation demo" width="310"></a> | <a href="docs/demos/hand2_pen_spin.gif"><img src="docs/demos/hand2_pen_spin.gif" alt="Wuji Hand 2 pen-spin demo" width="310"></a> |
 
 ## Contents
 

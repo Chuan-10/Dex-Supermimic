@@ -92,6 +92,10 @@ Viser playback uses one environment, opens a URL in the terminal, and runs until
 uv run dex-supermimic-play --checkpoint <checkpoint.pt>
 ```
 
+Pen-spin playback resets the hand and pen together when the pen moves more than
+20 cm from its reference position. This counts as a drop, not a completed clip;
+the 5 cm position-error limit used for training is unchanged.
+
 Inspect TensorBoard curves with:
 
 ```bash

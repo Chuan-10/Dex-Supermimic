@@ -19,12 +19,11 @@ from torch.nn import functional as F
 from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task
 
 from .rotations import mv, quat_to_mat
-
 from .metrics import MetricLogger
 from .buffer import ReplayBuffer
 from .common import RunningNorm
 from .mdp import angle_error
-from .networks import Actor, Critic, FailureHead, WorldModel
+from .networks import Actor, Critic, FailureHead, GaussianPPOActor, WorldModel
 from .observations import BASE_TERMS, CURRENT_TERMS, DR_PARAM_NAMES, TaskObservations
 from .sim import SimReader
 from .state import difference, ema_target, flatten_memory, unflatten_memory, unpack
@@ -47,6 +46,10 @@ LOG_SECTION_RENAMES = {
     "contact_digit_loss": "wm/contact_digit_loss",
     "actor_loss": "policy/actor_loss",
     "critic_loss": "policy/critic_loss",
+    "entropy": "policy/entropy",
+    "clip_fraction": "policy/clip_fraction",
+    "kl": "policy/kl",
+    "explained_variance": "policy/explained_variance",
     "drop_rate": "task/drop_rate",
     "rot_error": "task/rot_error",
     "finger_1_action": "task/finger_1_action",
@@ -167,6 +170,8 @@ class DexSuperMimicRunner:
             self.reader = SimReader(env)
         self.mdp = self.reader.mdp
         self.observations = PenObservations(self.reader) if self.is_pen else TaskObservations(self.reader)
+        self.ppo_memory = None
+        self.ppo_critic = None
         initial_context = self.observations.context(
             self.reader.state(), self.reader.memory(), self.observations.auxiliary(), self.reader.xi
         )
@@ -174,7 +179,18 @@ class DexSuperMimicRunner:
             self.reader.state(), self.reader.xi, self.observations.disturbance(self.observations.auxiliary())
         )
         self.reader.attach_capture()
-        self.actor = Actor(self.obs.shape[-1]).to(self.device)
+        ppo_enabled = cfg.algorithm == "ppo"
+        action_dim = len(self.reader.robot.joint_names)
+        self.actor = (
+            GaussianPPOActor(
+                self.obs.shape[-1],
+                action_dim,
+                init_std=cfg.ppo_init_std,
+                std_range=(cfg.ppo_std_min, cfg.ppo_std_max),
+            ).to(self.device)
+            if ppo_enabled
+            else Actor(self.obs.shape[-1]).to(self.device)
+        )
         contact_dim = self.reader.contact().shape[-1]
         dynamics_dim = initial_dynamics.shape[-1]
         self.dynamics_dim = dynamics_dim
@@ -203,10 +219,24 @@ class DexSuperMimicRunner:
         self.optimizers = {
             name: torch.optim.Adam(module.parameters(), lr=cfg.lr) for name, module in self.modules().items()
         }
-        self.optimizers["actor"] = torch.optim.AdamW(
-            self.actor.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=0.0
-        )
+        if ppo_enabled:
+            # Upstream Wuji-MJLab uses one Adam over actor+critic with a fixed LR.
+            # The real critic group is available only after the env managers exist,
+            # so construct it here from the current (pre-action) critic frame.
+            initial_critic_obs = env.observation_manager.compute(update_history=False)["critic"]
+            self.ppo_critic = Critic(initial_critic_obs.shape[-1], empirical_norm=True).to(self.device)
+            self.optimizers = {
+                "ppo": torch.optim.Adam(
+                    list(self.actor.parameters()) + list(self.ppo_critic.parameters()), lr=cfg.ppo_lr
+                )
+            }
+        else:
+            self.optimizers["actor"] = torch.optim.AdamW(
+                self.actor.parameters(), lr=cfg.lr, betas=(0.9, 0.95), weight_decay=0.0
+            )
+        self.cfg = cfg
         self.buffer = ReplayBuffer(cfg.buffer_steps, env.num_envs, self.device, cfg.holdout_fraction)
+        self.ppo_memory = None
         self.log_dir = Path(log_dir or cfg.log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         if cfg.wandb_mode:
@@ -223,12 +253,20 @@ class DexSuperMimicRunner:
         self.sim_steps = 0
         self.wall_offset = 0.0
         self.started_at = time.perf_counter()
-        self.env.cfg.auto_reset = False
-        self.env.max_common_steps = cfg.warmup_steps + int(cfg.max_iterations / cfg.utd)
+        if cfg.algorithm == "ppo":
+            # Curriculum uses the real horizon: rollout_steps per PPO update.
+            self.env.cfg.auto_reset = True
+            self.env.max_common_steps = cfg.warmup_steps + cfg.max_iterations * cfg.ppo_rollout_steps
+        else:
+            self.env.cfg.auto_reset = False
+            self.env.max_common_steps = cfg.warmup_steps + int(cfg.max_iterations / cfg.utd)
         self.step_wm = torch.compile(self.wm) if cfg.compile and str(self.device).startswith("cuda") else self.wm
         self.step_actor = (
             torch.compile(self.actor) if cfg.compile and str(self.device).startswith("cuda") else self.actor
         )
+        if cfg.algorithm == "ppo":
+            # The deterministic inference path is the Gaussian mean, not a sample.
+            self.step_actor = self.actor.mean
         self.reward_step = self.mdp.rewards
         self.task_features = self.observations.context
         self.wm_features = self.observations.dynamics
@@ -277,7 +315,18 @@ class DexSuperMimicRunner:
         }
         (self.log_dir / "input_layout.json").write_text(json.dumps(layout, indent=2))
 
+    def format_version(self):
+        return 4 if self.cfg.algorithm == "ppo" else 3
+
+    def _ensure_ppo_critic(self, observation):
+        """PPO consumes the environment's real critic group, not imagined features."""
+        if observation.shape[-1] != self.ppo_critic.norm._mean.shape[-1]:
+            raise ValueError("PPO critic observation dimension changed during rollout")
+        return self.ppo_critic
+
     def modules(self):
+        if self.cfg.algorithm == "ppo" and self.ppo_critic is not None:
+            return dict(actor=self.actor, critic=self.ppo_critic)
         return dict(actor=self.actor, wm=self.wm, fail_head=self.fail_head, critic=self.critic)
 
     def critic_features(self, context):
@@ -781,6 +830,8 @@ class DexSuperMimicRunner:
         )
 
     def learn(self):
+        if self.cfg.algorithm == "ppo":
+            return self.learn_ppo()
         start = self.started_at
         phase_times = {}
         phase_counts = {}
@@ -856,9 +907,173 @@ class DexSuperMimicRunner:
         self.save(self.log_dir / "model_final.pt", self.cfg.max_iterations)
         self.writer.close()
 
+    @torch.no_grad()
+    def collect_ppo(self, steps):
+        """Collect a complete on-policy rollout for one PPO update."""
+        obs_dim = self.obs.shape[-1]
+        action_dim = len(self.reader.robot.joint_names)
+        if self.ppo_memory is None:
+            self.ppo_memory = {
+                "obs": self.obs.new_empty(steps, self.env.num_envs, obs_dim),
+                "critic_obs": self.obs.new_empty(steps, self.env.num_envs, self.ppo_critic.norm._mean.shape[-1]),
+                "actions": self.obs.new_empty(steps, self.env.num_envs, action_dim),
+                "log_prob": self.obs.new_empty(steps, self.env.num_envs),
+                "value": self.obs.new_empty(steps, self.env.num_envs),
+                "reward": self.obs.new_empty(steps, self.env.num_envs),
+                "terminated": self.obs.new_empty(steps, self.env.num_envs),
+                "truncated": self.obs.new_empty(steps, self.env.num_envs),
+            }
+        elif self.ppo_memory["obs"].shape[0] != steps:
+            self.ppo_memory = {
+                name: value.new_empty(steps, *value.shape[1:]) for name, value in self.ppo_memory.items()
+            }
+        memory = self.ppo_memory
+
+        # PPO uses conventional vectorized auto-reset. Reuse the same actor,
+        # normalization, action dimensions, and task configuration.
+        self.env.cfg.auto_reset = True
+        self.env._manual_reset_pending.zero_()
+        gamma = self.cfg.ppo_gamma
+        for t in range(steps):
+            self.actor.norm.update(self.obs)
+            distribution = self.actor.distribution(self.obs)
+            action = distribution.sample()
+            critic_obs = self._critic_observation()
+            critic = self._ensure_ppo_critic(critic_obs)
+            self.ppo_critic.norm.update(critic_obs)
+            value = critic(critic_obs)
+            obs, reward, terminated, truncated, _ = self.env.step(action)
+            # rsl-rl treats timeouts as done but adds a bootstrapping reward
+            # correction before GAE. This reproduces upstream Wuji-MJLab exactly.
+            reward = reward + gamma * value * truncated.float()
+            memory["obs"][t] = self.obs
+            memory["critic_obs"][t] = critic_obs
+            memory["actions"][t] = action
+            memory["log_prob"][t] = distribution.log_prob(action).sum(-1)
+            memory["value"][t] = value
+            memory["reward"][t] = reward
+            memory["terminated"][t] = terminated
+            memory["truncated"][t] = truncated
+            self.obs = obs["policy"]
+            self.sim_steps += self.env.num_envs
+
+        self.reader.refresh_frame()
+        drop_name = "reference_end" if self.is_pen else "cage_drop"
+        drop = self.env.termination_manager.get_term(drop_name).float().mean()
+        return dict(
+            reward=memory["reward"].mean(),
+            drop_rate=drop,
+            actor_loss=memory["log_prob"].square().mean(),
+            critic_loss=memory["value"].square().mean(),
+            entropy=torch.zeros((), device=self.device),
+            clip_fraction=torch.zeros((), device=self.device),
+            kl=torch.zeros((), device=self.device),
+            explained_variance=torch.zeros((), device=self.device),
+            horizon=steps,
+        )
+
+    def _critic_observation(self):
+        return self.env.observation_manager.compute(update_history=False)["critic"]
+
+    def ppo_update(self):
+        c = self.cfg
+        memory = self.ppo_memory
+        batch, num_envs = memory["reward"].shape
+        flat_actor_obs = memory["obs"].reshape(-1, memory["obs"].shape[-1])
+        flat_obs = memory["critic_obs"].reshape(-1, memory["critic_obs"].shape[-1])
+        flat_actions = memory["actions"].reshape(-1, memory["actions"].shape[-1])
+        flat_old_log_prob = memory["log_prob"].reshape(-1)
+        flat_values = memory["value"].reshape(-1)
+
+        # rsl-rl GAE with timeout reward bootstrapping already applied above.
+        rewards = memory["reward"]
+        dones = (memory["terminated"].bool() | memory["truncated"].bool()).float()
+        critic = self._ensure_ppo_critic(memory["critic_obs"])
+        final_value = critic(self._critic_observation()).flatten()
+        advantages = torch.zeros_like(rewards)
+        gae = torch.zeros(num_envs, device=self.device)
+        for t in reversed(range(batch)):
+            next_non_terminal = 1.0 - dones[t]
+            next_value = final_value if t == batch - 1 else memory["value"][t + 1]
+            delta = rewards[t] + c.ppo_gamma * next_non_terminal * next_value - memory["value"][t]
+            gae = delta + c.ppo_gamma * c.lam * next_non_terminal * gae
+            advantages[t] = gae
+        flat_advantages = advantages.reshape(-1)
+        returns = flat_advantages + flat_values
+        if c.ppo_normalize_advantage:
+            flat_advantages = (flat_advantages - flat_advantages.mean()) / flat_advantages.std().clamp_min(1e-8)
+
+        count = batch * num_envs
+        usable_count = (count // c.ppo_minibatches) * c.ppo_minibatches
+        minibatch_size = max(1, count // c.ppo_minibatches)
+        actor_losses, critic_losses, entropies, clip_fractions, kls = [], [], [], [], []
+        for _ in range(c.ppo_epochs):
+            permutation = torch.randperm(usable_count, device=self.device)
+            for start in range(0, usable_count, minibatch_size):
+                ids = permutation[start : start + minibatch_size]
+                distribution = self.actor.distribution(flat_actor_obs[ids])
+                log_prob = distribution.log_prob(flat_actions[ids]).sum(-1)
+                with torch.no_grad():
+                    old_distribution = self.actor.distribution(flat_actor_obs[ids])
+                ratio = (log_prob - flat_old_log_prob[ids]).exp()
+                policy_loss = -torch.min(
+                    ratio * flat_advantages[ids],
+                    ratio.clamp(1.0 - c.ppo_clip, 1.0 + c.ppo_clip) * flat_advantages[ids],
+                ).mean()
+                entropy = distribution.entropy().sum(-1).mean()
+                values = critic(flat_obs[ids])
+                value_loss = (values - returns[ids]).square().mean()
+                loss = policy_loss + c.ppo_value_coef * value_loss - c.ppo_entropy * entropy
+                self.optimizers["ppo"].zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    tuple(self.actor.parameters()) + tuple(critic.parameters()), c.ppo_max_grad_norm
+                )
+                self.optimizers["ppo"].step()
+                with torch.no_grad():
+                    clip_fractions.append(((ratio - 1.0).abs() > c.ppo_clip).float().mean())
+                    kls.append(
+                        torch.distributions.kl_divergence(old_distribution, distribution).sum(-1).mean()
+                    )
+                actor_losses.append(policy_loss.detach())
+                critic_losses.append(value_loss.detach())
+                entropies.append(entropy.detach())
+
+        target_variance = returns.var()
+        explained = 1.0 - (returns - critic(flat_obs)).square().mean() / target_variance.clamp_min(1e-8)
+        return dict(
+            actor_loss=torch.stack(actor_losses).mean(),
+            critic_loss=torch.stack(critic_losses).mean(),
+            entropy=torch.stack(entropies).mean(),
+            clip_fraction=torch.stack(clip_fractions).mean(),
+            kl=torch.stack(kls).mean(),
+            explained_variance=explained.detach(),
+            horizon=batch,
+        )
+
+    def learn_ppo(self):
+        start = self.started_at
+        for it in range(self.iteration, self.cfg.max_iterations):
+            self.iteration = it
+            stats = self.collect_ppo(self.cfg.ppo_rollout_steps)
+            stats.update(self.ppo_update())
+            stats.update(
+                lr=self.cfg.ppo_lr,
+                wall_seconds=self.wall_offset + time.perf_counter() - start,
+                sim_steps=self.sim_steps,
+            )
+            if it % self.cfg.log_interval == 0:
+                scalar = organize_log_scalars(stats, it)
+                self.writer.log_scalars(scalar, it)
+                print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
+            if (it + 1) % self.cfg.save_interval == 0:
+                self.save(self.log_dir / f"model_{it + 1}.pt", it + 1)
+        self.save(self.log_dir / "model_final.pt", self.cfg.max_iterations)
+        self.writer.close()
+
     def save(self, path, next_iteration=None):
         state = dict(
-            format_version=3,
+            format_version=self.format_version(),
             reference_signature=getattr(self.mdp, "reference_signature", None),
             torque_norm=self.torque_norm.state_dict(),
             config=self.cfg.to_dict(),
@@ -900,12 +1115,17 @@ class DexSuperMimicRunner:
             raise ValueError("Checkpoint task mismatch")
         if getattr(self, "is_pen", False) and state.get("reference_signature") != self.mdp.reference_signature:
             raise ValueError("Pen-spin reference data mismatch")
-        if "utd" not in state["config"] or "critic_minibatches" not in state["config"]:
+        expected_version = self.format_version()
+        if expected_version == 3 and (
+            "utd" not in state["config"] or "critic_minibatches" not in state["config"]
+        ):
             raise ValueError(
                 "Checkpoint predates the SuperMimic training recipe. Start a fresh run, "
                 "or use --model-checkpoint to initialize only the world model and failure head."
             )
-        if state["format_version"] != 3 or state["joint_names"] != list(self.reader.robot.joint_names):
+        if state["format_version"] != expected_version or state["joint_names"] != list(
+            self.reader.robot.joint_names
+        ):
             raise ValueError("Checkpoint schema/joint order mismatch")
         if state["context_names"] != self.reader.context_names:
             raise ValueError("Context layout mismatch")

@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+from torch.distributions import Normal
 
 from .common import EmpiricalNorm, RunningNorm, mlp
 from .state import DELTA_DIM, STATE_DIM, integrate
@@ -85,7 +86,7 @@ class FailureHead(nn.Module):
 class Actor(nn.Module):
     def __init__(self, obs_dim=207):
         super().__init__()
-        self.norm = RunningNorm(obs_dim)
+        self.norm = EmpiricalNorm(obs_dim)
         self.net = mlp(obs_dim, [512, 256, 128], 20)
         nn.init.orthogonal_(self.net[-1].weight, gain=0.01)
         nn.init.zeros_(self.net[-1].bias)
@@ -94,22 +95,61 @@ class Actor(nn.Module):
         return torch.tanh(self.net(self.norm(obs)))
 
 
-class EmpiricalNormActor(Actor):
-    """Compatibility wrapper for PPO-branch checkpoints using EmpiricalNorm."""
+class GaussianPPOActor(nn.Module):
+    """Wuji-MJLab-style state-dependent diagonal Gaussian used by the PPO baseline.
 
-    def __init__(self, obs_dim=207):
-        super().__init__(obs_dim)
+    The final linear layer emits ``[mean, std]``. The std slice starts at
+    ``init_std`` with zero weights and is clamped to the same scalar range as
+    upstream's ``HeteroscedasticGaussianDistribution``. No tanh is applied: the
+    task action manager itself maps/clips normalized actions to joint targets.
+    """
+
+    def __init__(
+        self,
+        obs_dim,
+        action_dim,
+        hidden=(512, 256, 128),
+        init_std=0.5,
+        std_range=(0.2, 50.0),
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.init_std = init_std
+        self.std_range = std_range
         self.norm = EmpiricalNorm(obs_dim)
+        # Exactly mirror rsl-rl's default nn.Linear initialization; only the
+        # std-head rows/bias are overwritten below.
+        self.net = mlp(obs_dim, list(hidden), 2 * action_dim)
+        self._init_std_head()
+
+    def _init_std_head(self):
+        final = self.net[-1]
+        with torch.no_grad():
+            final.weight[self.action_dim :].zero_()
+            final.bias[self.action_dim :] = self.init_std
+
+    def distribution(self, obs):
+        mean, std = self.net(self.norm(obs)).unflatten(-1, (2, self.action_dim)).unbind(-2)
+        return Normal(mean, std.clamp(*self.std_range))
+
+    def forward(self, obs):
+        return self.distribution(obs).sample()
+
+    @torch.no_grad()
+    def mean(self, obs):
+        return self.distribution(obs).mean
 
 
 class Critic(nn.Module):
-    def __init__(self, dim, amp=True):
+    def __init__(self, dim, amp=True, empirical_norm=False):
         super().__init__()
         self.amp = amp
-        self.norm = RunningNorm(dim)
+        self.norm = EmpiricalNorm(dim) if empirical_norm else RunningNorm(dim)
         self.net = mlp(dim, [512, 512, 256, 128], 1)
 
     def forward(self, x):
+        if isinstance(self.norm, EmpiricalNorm):
+            return self.net(self.norm(x)).squeeze(-1)
         features = self.norm(x)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and x.is_cuda):
             return self.net(features).float().squeeze(-1)

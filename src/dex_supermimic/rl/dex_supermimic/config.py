@@ -69,11 +69,29 @@ class DexSuperMimicCfg:
     """Use dynamic shapes for imagination compilation (lower startup cost, less specialization)."""
     profile: bool = False
     """Log cumulative collect/world-model/policy wall time and phase fractions."""
-    save_interval: int = 2000
+    save_interval: int = 1000
     log_interval: int = 50
     holdout_fraction: float = 0.1
     log_dir: str = "logs/dex_supermimic"
     checkpoint: str | None = None
+    algorithm: str = "world_model"
+    """Training objective: world_model or ppo."""
+    ppo_rollout_steps: int = 100
+    """On-policy simulator transitions collected before each PPO update."""
+    ppo_epochs: int = 4
+    ppo_minibatches: int = 32
+    ppo_clip: float = 0.2
+    ppo_entropy: float = 0.001
+    ppo_value_coef: float = 0.5
+    ppo_max_grad_norm: float = 1.0
+    ppo_normalize_advantage: bool = True
+    ppo_lr: float = 1.0e-4
+    """Fixed PPO learning rate, matching the upstream Wuji-MJLab recipe."""
+    ppo_init_std: float = 0.5
+    ppo_std_min: float = 0.2
+    ppo_std_max: float = 50.0
+    ppo_gamma: float = 0.996
+    """Discount matching WujiHand2_Reorient_50Hz."""
 
     def __post_init__(self):
         if self.task not in ("hand1-reorient", "hand2-reorient", "hand2-pen-spin"):
@@ -126,6 +144,36 @@ class DexSuperMimicCfg:
             raise ValueError("critic_minibatches exceeds the imagined transition count")
         if self.failure_clip <= 0 or self.failure_clip > 1:
             raise ValueError("failure_clip must be in (0, 1]")
+        if self.algorithm not in ("world_model", "ppo"):
+            raise ValueError("algorithm must be world_model or ppo")
+        if self.algorithm == "ppo":
+            if self.task != "hand2-reorient":
+                raise ValueError("PPO is currently restricted to hand2-reorient")
+            if self.control_hz != 50:
+                raise ValueError("PPO exactly matches WujiHand2_Reorient_50Hz, not the 20Hz task")
+            if self.checkpoint:
+                raise ValueError("PPO checkpoints require a format_version=4 PPO checkpoint")
+            if self.model_checkpoint:
+                raise ValueError("model_checkpoint is incompatible with PPO training")
+            for name in ("ppo_rollout_steps", "ppo_epochs", "ppo_minibatches"):
+                if getattr(self, name) < 1:
+                    raise ValueError("PPO rollout, epoch, and minibatch counts must be positive")
+            if not 0 < self.ppo_clip:
+                raise ValueError("ppo_clip must be positive")
+            if self.ppo_value_coef < 0 or self.ppo_entropy < 0:
+                raise ValueError("PPO loss coefficients must be nonnegative")
+            if self.ppo_max_grad_norm <= 0:
+                raise ValueError("ppo_max_grad_norm must be positive")
+            if self.ppo_minibatches > self.num_envs * self.ppo_rollout_steps:
+                raise ValueError("ppo_minibatches exceeds PPO transitions per update")
+            if self.ppo_lr <= 0:
+                raise ValueError("ppo_lr must be positive")
+            if not 0 < self.ppo_gamma < 1:
+                raise ValueError("ppo_gamma must be in (0, 1)")
+            if not 0 < self.ppo_std_min < self.ppo_std_max:
+                raise ValueError("Require 0 < ppo_std_min < ppo_std_max")
+            if not self.ppo_std_min <= self.ppo_init_std <= self.ppo_std_max:
+                raise ValueError("ppo_init_std must lie within the std range")
 
     def to_dict(self):
         return asdict(self)

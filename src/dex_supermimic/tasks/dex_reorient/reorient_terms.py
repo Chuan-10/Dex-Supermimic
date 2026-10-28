@@ -46,6 +46,8 @@ HAND1_GEOM_SIZE_DR_GEOMS = (r".*finger[1-5]_link[2-3]_col",)
 
 ROBOT_PITCH_RANGE = (-0.4, 0.1)
 
+HISTORY_LENGTH = 3
+
 
 def build_reorient_observations(
     history_length: int,
